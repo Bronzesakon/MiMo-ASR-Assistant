@@ -1,0 +1,53 @@
+# Build outputs
+dist/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+target/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+
+# Logs
+*.log
+src-tauri/log/
+
+# Runtime generated
+src-tauri/config.json
+src-tauri/.mimo_cache/
+
+# Large binaries (managed separately, not in repo)
+src-tauri/resources/ffmpeg.exe
+src-tauri/WebView2Loader.dll
+MicrosoftEdgeWebview2Setup.exe
+
+# Tauri generated icons (reproducible from source)
+src-tauri/icons/Square*.png
+src-tauri/icons/StoreLogo.png
+
+# Reference projects (not part of build)
+参考项目/
+
+# Claude Code local settings
+.claude/
+.agents/
+.reasonix/
+
+# Temp
+*.tmp
+*.temp
+API接口规范文档.md
+CLAUDE.md
+项目文档.md
+transcribe.py
+/Mimo.code-workspace
+skills-lock.json
