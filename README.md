@@ -57,7 +57,7 @@ cd src-tauri && cargo check
 ```
 
 构建产物：
-- `src-tauri/target/release/mimo.exe`
+- `src-tauri/target/release/mimo-asr-assistant.exe`
 - `src-tauri/target/release/bundle/nsis/` (NSIS 安装包)
 
 ## 项目结构
@@ -66,18 +66,20 @@ cd src-tauri && cargo check
 ├── src/                    # Vue 3 前端
 │   ├── components/         # UI 组件
 │   ├── stores/             # Pinia 状态管理
-│   └── types/              # TypeScript 类型
+│   ├── types/              # TypeScript 类型
+│   └── utils/              # 工具函数（Markdown 渲染）
 ├── src-tauri/              # Rust 后端
 │   ├── src/
-│   │   ├── lib.rs          # Tauri 命令层
-│   │   ├── api/            # API 客户端
+│   │   ├── lib.rs          # Tauri 命令层 + 应用入口
+│   │   ├── main.rs         # 入口
+│   │   ├── api/            # API 客户端（流式 SSE + 标签过滤）
 │   │   ├── audio/          # 音频切分
 │   │   ├── ffmpeg/         # 纯 Rust 音频处理（解码/转码/切片）
 │   │   ├── prompt/         # 提示词模板
 │   │   ├── provider/       # 服务商配置
-│   │   ├── rate_limiter/   # 速率控制
-│   │   ├── dpapi/          # API Key 加密
-│   │   └── log/            # 日志系统
+│   │   ├── rate_limiter.rs # 速率控制
+│   │   ├── dpapi.rs        # API Key 加密（Windows DPAPI）
+│   │   └── log.rs          # 日志系统
 └── 项目文档.md              # 详细开发文档
 ```
 

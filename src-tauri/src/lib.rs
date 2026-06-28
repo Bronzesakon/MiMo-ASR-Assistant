@@ -439,7 +439,6 @@ async fn start_chat(
     info!("[{}] start_chat 开始: 模型={}, 文本长度={}", file_id, api_params.model, user_text.len());
 
     let config: api::ApiConfig = api_params.into();
-    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
     let plain_emitter = TauriEmitter { handle: handle.clone() };
     let limiter = handle.state::<rate_limiter::ChatRateLimiter>();
 
@@ -455,30 +454,44 @@ async fn start_chat(
     };
     let final_system_prompt = prompt::build_prompt(&template, "");
 
-    let result = api::stream_chat(
-        &final_system_prompt,
-        &user_text,
-        audio_data_url.as_deref(),
-        &config,
-        response_format.as_deref(),
-        &tagged_emitter,
-    )
-    .await;
+    let max_retries = 2;
+    let mut last_error = None;
 
-    match &result {
-        Ok(()) => {
-            let complete_json = serde_json::json!({ "file_id": file_id });
-            let _ = plain_emitter.emit("chat-complete", &complete_json.to_string());
-            info!("[{}] start_chat 完成", file_id);
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            info!("[{}] start_chat 重试第 {} 次", file_id, attempt);
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
-        Err(e) => {
-            error!("[{}] start_chat 失败: {} (模型={}, 文本长度={})", file_id, e, config.model, user_text.len());
-            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
+
+        // 每次重试需要新的 emitter（SSE 流式状态不可复用）
+        let retry_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
+
+        match api::stream_chat(
+            &final_system_prompt,
+            &user_text,
+            audio_data_url.as_deref(),
+            &config,
+            response_format.as_deref(),
+            &retry_emitter,
+        ).await {
+            Ok(()) => {
+                let complete_json = serde_json::json!({ "file_id": file_id });
+                let _ = plain_emitter.emit("chat-complete", &complete_json.to_string());
+                info!("[{}] start_chat 完成", file_id);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("[{}] start_chat 尝试 {} 失败: {}", file_id, attempt + 1, e);
+                last_error = Some(e);
+            }
         }
     }
 
-    result.map_err(|e| e.to_string())
+    let e = last_error.unwrap();
+    error!("[{}] start_chat 最终失败 (已重试 {} 次): {} (模型={}, 文本长度={})", file_id, max_retries, e, config.model, user_text.len());
+    let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
+    let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
+    Err(e.to_string())
 }
 
 /// 隐藏主窗口（最小化到托盘）

@@ -7,7 +7,7 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .pool_max_idle_per_host(10)
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client")
     })
@@ -209,7 +209,6 @@ pub async fn stream_transcription(
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", config.api_key))
-        .timeout(std::time::Duration::from_secs(120))
         .json(&body)
         .send()
         .await
@@ -315,7 +314,6 @@ pub async fn stream_chat(
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", config.api_key))
-        .timeout(std::time::Duration::from_secs(60))
         .json(&body)
         .send()
         .await
@@ -493,7 +491,21 @@ async fn parse_sse_stream(
     use futures::StreamExt;
     let mut stream = stream;
 
-    while let Some(chunk_result) = stream.next().await {
+    // 空闲超时：90s 无新数据视为连接中断（不设总时长上限）
+    let idle_timeout = std::time::Duration::from_secs(90);
+
+    loop {
+        let chunk_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(opt) => match opt {
+                Some(result) => result,
+                None => break, // 流正常结束（服务端关闭连接）
+            },
+            Err(_) => {
+                log::error!("SSE 流式响应中断: {}s 无新数据", idle_timeout.as_secs());
+                return Err(ApiError::HttpError(format!("流式响应中断: {}s 无新数据", idle_timeout.as_secs())));
+            }
+        };
+
         let chunk = chunk_result.map_err(|e| ApiError::HttpError(e.to_string()))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
