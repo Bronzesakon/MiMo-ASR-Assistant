@@ -13,14 +13,12 @@ const store = useAppStore()
 
 onMounted(async () => {
   document.addEventListener('contextmenu', e => e.preventDefault())
-  const start = Date.now()
   // 配置加载与 splash 最短显示时间并行
   await Promise.all([
     store.loadConfig().catch(e => console.error('loadConfig failed:', e)),
     new Promise(resolve => setTimeout(resolve, 1200)),
   ])
   ;(window as any).__hideSplash?.()
-  console.log(`[启动] splash 显示 ${Date.now() - start}ms`)
 })
 </script>
 
@@ -33,7 +31,7 @@ onMounted(async () => {
       <Workspace />
     </div>
     <StatusBar />
-    <SettingsDrawer v-if="store.isSettingsOpen" />
+    <SettingsDrawer v-show="store.isSettingsOpen" />
     <Toast />
   </div>
 </template>

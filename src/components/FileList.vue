@@ -8,6 +8,7 @@ import { listen } from '@tauri-apps/api/event'
 const store = useAppStore()
 const query = ref('')
 const showLangMenu = ref<string | null>(null) // fileId or null
+const dragCounter = ref(0)
 
 const LANGUAGES = [
   { code: 'auto', label: '自动检测' },
@@ -49,6 +50,15 @@ onMounted(async () => {
     } catch {}
   })
   unlistenFns.push(fn)
+
+  // Tauri 原生拖拽：提供完整文件路径
+  const { getCurrentWindow } = await import('@tauri-apps/api/window')
+  const unlistenDrop = await getCurrentWindow().onDragDropEvent((event) => {
+    if (event.payload.type === 'drop') {
+      addDropFiles(event.payload.paths)
+    }
+  })
+  unlistenFns.push(unlistenDrop)
 })
 
 onUnmounted(() => unlistenFns.forEach(fn => fn()))
@@ -60,8 +70,39 @@ function fmtDur(s: number) {
   return `${m}:${String(sec).padStart(2, '0')}`
 }
 
-function select(id: string) { store.selectFile(id); closeAllDropdowns() }
-function remove(id: string, e: Event) { e.stopPropagation(); store.removeFile(id) }
+function select(id: string) { closeAllDropdowns(); store.selectFile(id) }
+function remove(id: string, e: Event) { e.stopPropagation(); closeAllDropdowns(); store.requestCancelFile(id); store.removeFile(id) }
+
+// 拖拽导入
+const AUDIO_EXTS = ['.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg']
+function onSidebarDragEnter(e: DragEvent) { e.preventDefault(); dragCounter.value++ }
+function onSidebarDragLeave(e: DragEvent) { e.preventDefault(); if (--dragCounter.value <= 0) dragCounter.value = 0 }
+function onSidebarDrop(e: DragEvent) { e.preventDefault(); dragCounter.value = 0 }
+
+async function addDropFiles(paths: string[]) {
+  if (!store.apiConfig.apiKey?.trim()) {
+    store.showToastMessage('请先填写 API Key', 'error')
+    store.isSettingsOpen = true
+    return
+  }
+  const audioPaths = paths.filter(p => AUDIO_EXTS.some(ext => p.toLowerCase().endsWith(ext)))
+  if (audioPaths.length === 0) { store.showToastMessage('未检测到支持的音频文件', 'error'); return }
+  for (const path of audioPaths) {
+    const name = path.split(/[/\\]/).pop() || path
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    let duration = 0
+    try { duration = await invoke<number>('get_audio_duration', { filePath: path }) } catch {}
+    store.addFile({
+      id, name, path, duration, size: 0,
+      status: 'waiting', progress: 0,
+      transcription: '', polished: '',
+      transcriptionWordCount: 0, polishedWordCount: 0,
+      polishStage: 'idle',
+    })
+    store.selectFile(id)
+  }
+  store.showToastMessage(`已导入 ${audioPaths.length} 个音频文件`, 'success')
+}
 function closeAllDropdowns() {
   document.querySelectorAll('.export-wrap.open').forEach(el => el.classList.remove('open'))
   showLangMenu.value = null
@@ -69,6 +110,7 @@ function closeAllDropdowns() {
 
 // 显示语言选择
 function showLanguageSelector(fileId: string) {
+  closeAllDropdowns()
   const file = store.files.find(f => f.id === fileId)
   if (!file || file.status === 'transcribing' || file.status === 'processing' || file.status === 'polishing') return
   showLangMenu.value = fileId
@@ -85,7 +127,7 @@ async function transcribeFile(fileId: string, language: string) {
   const file = store.files.find(f => f.id === fileId)
   if (!file || file.status === 'transcribing' || file.status === 'processing') return
 
-  console.log(`[转写] 开始: ${file.name} (${fileId}), 语言=${language}`)
+  console.log(`[转写] 开始: ${file.name}, 语言=${language}`)
 
   store.updateFile(fileId, {
     status: 'processing', progress: 0,
@@ -104,7 +146,6 @@ async function transcribeFile(fileId: string, language: string) {
   state.currentSlice = 0
 
   try {
-    console.log(`[转写] 开始处理并转写: ${file.name}`)
     store.updateFile(fileId, { status: 'transcribing' })
 
     await invoke('process_and_transcribe', {
@@ -117,9 +158,8 @@ async function transcribeFile(fileId: string, language: string) {
         language,
       },
     })
-    console.log(`[转写] 完成: ${file.name}`)
   } catch (e) {
-    console.error(`[转写] 失败: ${file.name} (${fileId})`, e)
+    console.error(`[转写] 失败: ${file.name}`, e)
     const errMsg = String(e).replace(/^Error invoking plugin /, '').slice(0, 200)
     store.updateFile(fileId, { status: 'failed', error: errMsg })
     store.showToastMessage(`${file?.name || '文件'} 转写失败`, 'error')
@@ -131,12 +171,13 @@ async function transcribeFile(fileId: string, language: string) {
 const POLISH_PROMPT = `给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落`
 
 async function polishFile(fileId: string) {
+  closeAllDropdowns()
   const file = store.files.find(f => f.id === fileId)
   if (!file || !file.transcription || file.status === 'polishing') return
 
   const polishPrompt = store.apiConfig.polishPrompt || POLISH_PROMPT
 
-  console.log(`[规整] 开始: ${file.name} (${fileId}), 文本长度=${file.transcription.length}`)
+  console.log(`[规整] 开始: ${file.name}, 文本长度=${file.transcription.length}`)
 
   store.polishEnabledFileId = fileId
   store.selectFile(fileId)
@@ -153,6 +194,7 @@ async function polishFile(fileId: string) {
   try {
     await invoke('start_chat', {
       fileId,
+      fileName: file.name,
       systemPrompt: polishPrompt,
       userText: file.transcription,
       audioDataUrl: null,
@@ -164,9 +206,8 @@ async function polishFile(fileId: string) {
       },
       responseFormat: null,
     })
-    console.log(`[规整] 完成: ${file.name}`)
   } catch (e) {
-    console.error(`[规整] 失败: ${file.name} (${fileId})`, e)
+    console.error(`[规整] 失败: ${file.name}`, e)
     const errMsg = String(e).replace(/^Error invoking plugin /, '').slice(0, 200)
     store.updateFile(fileId, { status: 'completed', polishStage: 'failed', error: errMsg })
     store.showToastMessage(`${file?.name || '文件'} 规整失败`, 'error')
@@ -174,6 +215,7 @@ async function polishFile(fileId: string) {
 }
 
 async function exportFile(fileId: string, type: 'original' | 'polished') {
+  closeAllDropdowns()
   const file = store.files.find(f => f.id === fileId)
   if (!file) return
   const content = type === 'original' ? file.transcription : file.polished
@@ -226,7 +268,11 @@ function polishStageText(file: any): string {
       <input v-model="query" type="text" placeholder="搜索" class="search-input" />
     </div>
 
-    <div class="file-list" @click="closeAllDropdowns">
+    <div class="file-list" @click="closeAllDropdowns" @dragenter="onSidebarDragEnter" @dragleave="onSidebarDragLeave" @dragover.prevent @drop="onSidebarDrop">
+      <div v-if="dragCounter > 0" class="drag-overlay">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 3v12M8 11l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><rect x="3" y="16" width="18" height="5" rx="2" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span>将文件拖动到此处加入队列</span>
+      </div>
       <div
         v-for="(f, i) in files" :key="f.id"
         class="file-item"
@@ -329,7 +375,7 @@ function polishStageText(file: any): string {
 .search-input { width: 100%; height: 32px; padding: 0 var(--space-2) 0 30px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-primary); font-size: 12px; font-family: var(--font-sans); outline: none; transition: all 0.15s var(--ease-out); }
 .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(110, 158, 255, 0.15); background: var(--bg-base); }
 .search-input::placeholder { color: var(--text-disabled); }
-.file-list { flex: 1; overflow-y: auto; padding: var(--space-2); display: flex; flex-direction: column; gap: var(--space-1); }
+.file-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--space-2); display: flex; flex-direction: column; gap: var(--space-1); position: relative; }
 
 /* File item card */
 .file-item {
@@ -339,6 +385,7 @@ function polishStageText(file: any): string {
   cursor: pointer;
   transition: all 0.2s var(--ease-out);
   position: relative;
+  max-width: 100%;
 }
 .file-item:hover {
   background: var(--bg-hover);
@@ -406,8 +453,8 @@ function polishStageText(file: any): string {
 .action-btn:active { transform: scale(0.97); }
 .action-btn.disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; color: var(--text-disabled); }
 .export-wrap { position: relative; }
-.export-dropdown { display: none; position: absolute; bottom: 100%; left: 0; margin-bottom: var(--space-1); min-width: 120px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: var(--space-1); z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
-.export-wrap.open .export-dropdown { display: block; }
+.export-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: var(--space-1); min-width: 120px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: var(--space-1); z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateY(4px) scale(0.97); pointer-events: none; transition: opacity 0.15s var(--ease-out), transform 0.15s var(--ease-out); }
+.export-wrap.open .export-dropdown { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
 .export-item { width: 100%; height: 26px; padding: 0 var(--space-2); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); font-size: 11px; font-family: var(--font-sans); cursor: pointer; text-align: left; white-space: nowrap; transition: background var(--duration-fast) var(--ease-out); }
 .export-item:hover { background: var(--bg-hover); }
 
@@ -489,4 +536,27 @@ function polishStageText(file: any): string {
 }
 
 .file-empty { padding: var(--space-8) var(--space-4); text-align: center; font-size: 12px; color: var(--text-disabled); }
+
+.drag-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-surface);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  z-index: 10;
+  pointer-events: none;
+  animation: drag-fade-in 0.15s var(--ease-out);
+}
+@keyframes drag-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 </style>

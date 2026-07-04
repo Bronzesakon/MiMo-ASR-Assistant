@@ -182,6 +182,7 @@ pub async fn stream_transcription(
     audio_data_url: &str,
     config: &ApiConfig,
     emitter: &impl Emitter,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ApiError> {
     config.validate()?;
 
@@ -227,7 +228,7 @@ pub async fn stream_transcription(
     }
 
     // 尝试流式解析，失败则降级为非流式
-    match parse_sse_stream(response, emitter, "transcription-chunk", "transcription-complete").await {
+    match parse_sse_stream(response, emitter, "transcription-chunk", "transcription-complete", cancelled).await {
         Ok(()) => Ok(()),
         Err(ApiError::ParseError(msg)) => {
             log::warn!("SSE 流解析失败，降级为非流式请求: {}", msg);
@@ -254,6 +255,7 @@ pub async fn stream_chat(
     config: &ApiConfig,
     response_format: Option<&str>,
     emitter: &impl Emitter,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ApiError> {
     config.validate()?;
 
@@ -331,7 +333,7 @@ pub async fn stream_chat(
         return Err(ApiError::HttpError(format!("{}: {}", status, body)));
     }
 
-    parse_sse_stream(response, emitter, "chat-chunk", "chat-complete").await
+    parse_sse_stream(response, emitter, "chat-chunk", "chat-complete", cancelled).await
 }
 
 // ============================================================
@@ -483,7 +485,9 @@ async fn parse_sse_stream(
     emitter: &impl Emitter,
     chunk_event: &str,
     _complete_event: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ApiError> {
+    use std::sync::atomic::Ordering;
     let stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut tag_filter = TagFilter::new();
@@ -495,6 +499,9 @@ async fn parse_sse_stream(
     let idle_timeout = std::time::Duration::from_secs(90);
 
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let chunk_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
             Ok(opt) => match opt {
                 Some(result) => result,

@@ -1,19 +1,11 @@
 <script setup lang="ts">
 import { useAppStore } from '../stores/app'
 const store = useAppStore()
-
-function fmtSpeed(b: number) {
-  if (!b) return '--'
-  return b < 1048576 ? `${(b/1024).toFixed(1)} KB/s` : `${(b/1048576).toFixed(1)} MB/s`
-}
 </script>
 
 <template>
   <div class="status">
     <span class="status-model">{{ store.statusInfo.modelName }}</span>
-    <span class="status-sep" />
-    <span class="status-label">上传</span>
-    <span class="status-val">{{ fmtSpeed(store.statusInfo.uploadSpeed) }}</span>
     <span class="status-sep" />
     <span class="status-label">输出</span>
     <span class="status-val">{{ store.statusInfo.outputSpeed }} 字/s</span>

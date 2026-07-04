@@ -22,6 +22,7 @@ export interface ApiConfig {
   polishModel: string
   polishPrompt: string
   providerKeys: Record<string, string>
+  loggingEnabled: boolean
 }
 
 export interface ProviderInfo {

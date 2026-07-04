@@ -29,6 +29,7 @@ const hasPolished = computed(() =>
   (store.selectedFile?.polished?.length ?? 0) > 0
 )
 
+watch(() => store.selectedFileId, () => { autoScroll.value = true })
 watch(() => store.selectedFile?.transcription, () => {
   if (autoScroll.value) nextTick(() => textRef.value && (textRef.value.scrollTop = textRef.value.scrollHeight))
 })
@@ -39,6 +40,12 @@ watch(() => store.selectedFile?.polished, () => {
 function onScroll() {
   const el = textRef.value
   if (el) autoScroll.value = Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 60
+}
+
+function onWheel(e: WheelEvent) {
+  if (e.deltaY < 0 && (e.target as HTMLElement)?.closest?.('.ws-body')?.contains(textRef.value)) {
+    autoScroll.value = false
+  }
 }
 
 function goBottom() {
@@ -66,7 +73,7 @@ async function copyText(type: 'original' | 'polished') {
 </script>
 
 <template>
-  <div class="workspace">
+  <div class="workspace" @wheel="onWheel">
     <!-- 空状态 -->
     <div v-if="!store.selectedFile" class="ws-empty">
       <div class="ws-empty-content">
@@ -87,7 +94,7 @@ async function copyText(type: 'original' | 'polished') {
           <button v-if="hasOriginal" class="ws-btn" :class="{ copied: copiedOriginal }" @click="copyText('original')">
             {{ copiedOriginal ? '已复制' : '复制' }}
           </button>
-          <button v-if="!autoScroll && hasOriginal" class="ws-btn" @click="goBottom">
+          <button v-if="hasOriginal && store.selectedFile?.status === 'transcribing' && !autoScroll" class="ws-btn" @click="goBottom">
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M2 6l3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
@@ -114,7 +121,7 @@ async function copyText(type: 'original' | 'polished') {
             <button v-if="hasOriginal" class="ws-btn" :class="{ copied: copiedOriginal }" @click="copyText('original')">
               {{ copiedOriginal ? '已复制' : '复制' }}
             </button>
-            <button v-if="!autoScroll && hasOriginal" class="ws-btn" @click="goBottom">
+            <button v-if="hasOriginal && store.selectedFile?.status === 'transcribing' && !autoScroll" class="ws-btn" @click="goBottom">
               <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M2 6l3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
           </div>
@@ -242,6 +249,9 @@ async function copyText(type: 'original' | 'polished') {
   line-height: 1.75;
   color: var(--text-primary);
   word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 .ws-hint {
@@ -342,5 +352,30 @@ async function copyText(type: 'original' | 'polished') {
 
 :deep(.md-content) del {
   color: var(--text-tertiary);
+}
+
+:deep(.md-content) table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 13px;
+}
+
+:deep(.md-content) th,
+:deep(.md-content) td {
+  border: 1px solid var(--border-default);
+  padding: 6px 10px;
+  text-align: left;
+  word-break: break-word;
+}
+
+:deep(.md-content) th {
+  background: var(--bg-elevated);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+:deep(.md-content) tr:nth-child(even) td {
+  background: var(--bg-elevated);
 }
 </style>

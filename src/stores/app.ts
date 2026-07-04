@@ -13,6 +13,7 @@ interface RustConfig {
   theme: string
   polish_prompt: string
   provider_keys: Record<string, string>
+  logging_enabled: boolean
 }
 
 interface FileProcessState {
@@ -22,6 +23,7 @@ interface FileProcessState {
   uploadSpeedCount: number
   totalSlices: number
   currentSlice: number
+  transcriptionChunks: number
   polishChunkCount: number
   polishFirstChunk: boolean
 }
@@ -47,11 +49,13 @@ export const useAppStore = defineStore('app', () => {
     polishModel: 'mimo-v2.5',
     polishPrompt: '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落',
     providerKeys: {},
+    loggingEnabled: true,
   })
 
   const fileStates = new Map<string, FileProcessState>()
 
   const statusInfo = computed(() => {
+    void speedTick.value // 每秒强制重算输出速度
     let totalUploadSpeed = 0
     let totalOutputSpeed = 0
 
@@ -77,6 +81,7 @@ export const useAppStore = defineStore('app', () => {
   })
 
   const globalTokenCount = ref(0)
+  const speedTick = ref(0)
 
   const selectedFile = computed(() =>
     files.value.find(f => f.id === selectedFileId.value) || null
@@ -112,6 +117,7 @@ export const useAppStore = defineStore('app', () => {
         polishModel: config.polish_model,
         polishPrompt: config.polish_prompt || '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落',
         providerKeys: config.provider_keys || {},
+        loggingEnabled: config.logging_enabled ?? true,
       }
       theme.value = (config.theme as 'system' | 'light' | 'dark') || 'system'
       applyTheme()
@@ -132,6 +138,7 @@ export const useAppStore = defineStore('app', () => {
           theme: theme.value,
           polish_prompt: apiConfig.value.polishPrompt,
           provider_keys: apiConfig.value.providerKeys,
+          logging_enabled: apiConfig.value.loggingEnabled,
         }
       })
     } catch (e) {
@@ -219,6 +226,7 @@ export const useAppStore = defineStore('app', () => {
         transcribeStartTime: 0, outputCharCount: 0,
         uploadSpeedSum: 0, uploadSpeedCount: 0,
         totalSlices: 0, currentSlice: 0,
+        transcriptionChunks: 0,
         polishChunkCount: 0, polishFirstChunk: false,
       }
       fileStates.set(fileId, state)
@@ -234,12 +242,14 @@ export const useAppStore = defineStore('app', () => {
         const fileId = data.file_id
         const text = data.text || ''
         const file = files.value.find(f => f.id === fileId)
+        if (!file) return
         if (file) {
           file.transcription += text
           file.transcriptionWordCount = countWords(file.transcription)
         }
         const state = ensureFileState(fileId)
         state.outputCharCount += text.length
+        state.transcriptionChunks++
       } catch (e) {
         console.error('[事件] transcription-chunk 解析失败:', e)
       }
@@ -257,11 +267,13 @@ export const useAppStore = defineStore('app', () => {
         if (total > 0) state.totalSlices = total
         if (!isNaN(current) && current > state.currentSlice) {
           state.currentSlice = current
-          console.log(`[转写] ${fileId} 分片进度: ${current}/${total}`)
         }
         // 进度 = 正在处理的分片序号 / 总分片数
         if (file && state.totalSlices > 0) {
-          file.progress = Math.round((state.currentSlice / state.totalSlices) * 100)
+          const sliceProgress = state.currentSlice / state.totalSlices
+          const chunks = state.transcriptionChunks
+          const textProgress = chunks > 0 ? 1 - 1 / (1 + chunks * 0.1) : 0
+          file.progress = Math.min(97, Math.round(sliceProgress * 70 + textProgress * 30))
         }
       } catch (e) {
         console.error('[事件] transcription-progress 解析失败:', e)
@@ -315,6 +327,7 @@ export const useAppStore = defineStore('app', () => {
         const fileId = data.file_id
         const text = data.text || ''
         const file = files.value.find(f => f.id === fileId)
+        if (!file) return
         if (file) {
           file.polished += text
           file.polishedWordCount = countWords(file.polished)
@@ -322,7 +335,6 @@ export const useAppStore = defineStore('app', () => {
         const state = ensureFileState(fileId)
         if (!state.polishFirstChunk) {
           state.polishFirstChunk = true
-          console.log(`[规整] ${fileId} 开始接收流式数据`)
           // 更新 UI 状态为"接收中"
           if (file) updateFile(fileId, { polishStage: 'receiving' } as any)
         }
@@ -378,15 +390,23 @@ export const useAppStore = defineStore('app', () => {
     }).then(fn => unlistenFns.push(fn))
 
     // 处理阶段状态
-    listen<string>('process-status', (event) => {
-      try {
-        const data = JSON.parse(event.payload)
-        console.log(`[处理] ${data.file_id} 阶段: ${data.stage}`)
-      } catch {}
+    listen<string>('process-status', (_event) => {
     }).then(fn => unlistenFns.push(fn))
+
+    // 每秒刷新输出速度
+    setInterval(() => {
+      if (files.value.some(f => f.status === 'transcribing' || f.status === 'processing')) {
+        speedTick.value++
+      }
+    }, 1000)
   }
 
   setupEventListeners()
+
+  function requestCancelFile(fileId: string) {
+    const file = files.value.find(f => f.id === fileId)
+    invoke('cancel_task', { fileId, fileName: file?.name || fileId }).catch(() => {})
+  }
 
   return {
     files, selectedFileId, polishEnabledFileId, isPolishEnabled,
@@ -396,5 +416,6 @@ export const useAppStore = defineStore('app', () => {
     showToastMessage, loadConfig, saveConfig, setTheme, applyTheme,
     addFile, removeFile, updateFile, selectFile, clearCompleted,
     setPolishEnabled, resetStatus, ensureFileState, fileStates,
+    requestCancelFile, speedTick,
   }
 })

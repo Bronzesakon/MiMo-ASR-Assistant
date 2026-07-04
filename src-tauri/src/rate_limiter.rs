@@ -56,13 +56,6 @@ impl RateLimiter {
 
         self.semaphore.clone().acquire_owned().await.unwrap()
     }
-
-    pub fn current_rpm(&self) -> usize {
-        let times = self.request_times.lock().unwrap();
-        let now = std::time::Instant::now();
-        let one_minute = std::time::Duration::from_secs(60);
-        times.iter().filter(|t| now.duration_since(**t) <= one_minute).count()
-    }
 }
 
 /// ASR 速率控制器（100 RPM API 上限，留 10% 余量 → 90 RPM，3 并发）

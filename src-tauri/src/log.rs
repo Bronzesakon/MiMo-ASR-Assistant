@@ -2,9 +2,16 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Local;
 
 static LOG_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static LOGGING_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 设置日志开关
+pub fn set_enabled(v: bool) {
+    LOGGING_ENABLED.store(v, Ordering::Relaxed);
+}
 
 /// 初始化日志系统
 pub fn init_log() {
@@ -26,6 +33,11 @@ pub fn init_log() {
 
 /// 写入日志
 pub fn log(level: &str, msg: &str) {
+    // ERROR 级别始终输出；其他级别受开关控制
+    if level != "ERROR" && !LOGGING_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
     let now = Local::now();
     let timestamp = now.format("%H:%M:%S%.3f");
     let line = format!("[{}] [{}] {}\n", timestamp, level, msg);

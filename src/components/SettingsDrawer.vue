@@ -65,6 +65,12 @@ function getHelpContent(data: { text: string; links: HelpLink[] }): string {
   return result
 }
 
+function onToggleLogging(v: boolean) {
+  store.apiConfig.loggingEnabled = v
+  store.saveConfig()
+  invoke('set_logging_enabled', { enabled: v }).catch(() => {})
+}
+
 function close() { store.isSettingsOpen = false; store.saveConfig() }
 
 function onProvider() {
@@ -152,6 +158,23 @@ function openLogDir() {
             </div>
           </div>
 
+          <div class="field">
+            <div class="toggle-row">
+              <label class="label" style="margin-bottom:0">日志输出</label>
+              <button
+                class="toggle"
+                :class="{ on: store.apiConfig.loggingEnabled }"
+                @click="onToggleLogging(!store.apiConfig.loggingEnabled)"
+                :aria-pressed="store.apiConfig.loggingEnabled"
+              >
+                <span class="toggle-knob" />
+              </button>
+            </div>
+            <div class="hint-box">
+              <p class="hint-text">关闭后不再输出运行日志，错误日志始终保留。重启后生效。</p>
+            </div>
+          </div>
+
           <div class="field field-footer">
             <button class="key-toggle" @click="openLogDir">查看日志</button>
             <span class="hint-trigger hint-static">遇到问题？请查看日志信息</span>
@@ -173,6 +196,7 @@ function openLogDir() {
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: opacity 0.25s var(--ease-out);
 }
 
 .panel {
@@ -383,6 +407,55 @@ function openLogDir() {
   display: block;
 }
 
+.hint-static:hover {
+  color: var(--text-tertiary);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toggle {
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  border: 1px solid var(--border-default);
+  background: var(--border-default);
+  cursor: pointer;
+  position: relative;
+  padding: 0;
+  transition: all 0.2s var(--ease-out);
+  flex-shrink: 0;
+}
+
+.toggle:hover {
+  border-color: var(--border-strong);
+}
+
+.toggle.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.toggle-knob {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-base);
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  transition: transform 0.2s var(--ease-out);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.toggle.on .toggle-knob {
+  transform: translateX(16px);
+}
+
 .field-footer {
   padding-top: var(--space-4);
   border-top: 1px solid var(--border-default);
@@ -390,11 +463,6 @@ function openLogDir() {
 
 .hint-box {
   margin-top: var(--space-2);
-  padding: var(--space-3);
-  background: var(--bg-hover);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  overflow: hidden;
 }
 
 .hint-text {
