@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { save } from '@tauri-apps/plugin-dialog'
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 
 const store = useAppStore()
 const query = ref('')
@@ -52,7 +53,6 @@ onMounted(async () => {
   unlistenFns.push(fn)
 
   // Tauri 原生拖拽：提供完整文件路径
-  const { getCurrentWindow } = await import('@tauri-apps/api/window')
   const unlistenDrop = await getCurrentWindow().onDragDropEvent((event) => {
     if (event.payload.type === 'drop') {
       addDropFiles(event.payload.paths)
@@ -80,7 +80,7 @@ function onSidebarDragLeave(e: DragEvent) { e.preventDefault(); if (--dragCounte
 function onSidebarDrop(e: DragEvent) { e.preventDefault(); dragCounter.value = 0 }
 
 async function addDropFiles(paths: string[]) {
-  if (!store.apiConfig.apiKey?.trim()) {
+  if (!store.asrKey?.trim()) {
     store.showToastMessage('请先填写 API Key', 'error')
     store.isSettingsOpen = true
     return
@@ -152,8 +152,8 @@ async function transcribeFile(fileId: string, language: string) {
       fileId,
       filePath: file.path,
       apiParams: {
-        base_url: store.apiConfig.baseUrl,
-        api_key: store.apiConfig.apiKey,
+        base_url: store.asrBaseUrl,
+        api_key: store.asrKey,
         model: store.apiConfig.transcriptionModel,
         language,
       },
@@ -199,8 +199,8 @@ async function polishFile(fileId: string) {
       userText: file.transcription,
       audioDataUrl: null,
       apiParams: {
-        base_url: store.apiConfig.baseUrl,
-        api_key: store.apiConfig.apiKey,
+        base_url: store.polishBaseUrl,
+        api_key: store.polishKey,
         model: store.apiConfig.polishModel,
         language: 'auto',
       },

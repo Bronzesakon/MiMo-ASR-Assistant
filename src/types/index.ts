@@ -23,6 +23,8 @@ export interface ApiConfig {
   polishPrompt: string
   providerKeys: Record<string, string>
   loggingEnabled: boolean
+  asrProvider: string
+  polishProvider: string
 }
 
 export interface ProviderInfo {

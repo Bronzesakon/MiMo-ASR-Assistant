@@ -18,7 +18,7 @@ function fmtDur(s: number) {
 }
 
 async function importAudio() {
-  if (!store.apiConfig.apiKey?.trim()) {
+  if (!store.asrKey?.trim()) {
     store.showToastMessage('请先填写 API Key', 'error')
     store.isSettingsOpen = true
     return

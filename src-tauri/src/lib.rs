@@ -140,9 +140,17 @@ pub struct AppConfig {
     pub provider_keys: HashMap<String, String>,
     #[serde(default = "default_true")]
     pub logging_enabled: bool,
+    #[serde(default = "default_asr_provider")]
+    pub asr_provider: String,
+    #[serde(default = "default_polish_provider")]
+    pub polish_provider: String,
 }
 
 fn default_true() -> bool { true }
+
+fn default_asr_provider() -> String { "mimo-api".to_string() }
+
+fn default_polish_provider() -> String { "deepseek".to_string() }
 
 fn default_polish_prompt() -> String {
     "给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落".to_string()
@@ -160,6 +168,8 @@ impl Default for AppConfig {
             polish_prompt: default_polish_prompt(),
             provider_keys: HashMap::new(),
             logging_enabled: true,
+            asr_provider: "mimo-api".to_string(),
+            polish_provider: "deepseek".to_string(),
         }
     }
 }
@@ -179,6 +189,17 @@ fn load_config() -> AppConfig {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let mut config: AppConfig = serde_json::from_str(&content).unwrap_or_default();
+                // 迁移旧配置：无 asr_provider 时从旧 provider 推导
+                if config.asr_provider.is_empty() {
+                    config.asr_provider = if config.provider == "deepseek" {
+                        "mimo-api".to_string()
+                    } else {
+                        config.provider.clone()
+                    };
+                }
+                if config.polish_provider.is_empty() {
+                    config.polish_provider = config.provider.clone();
+                }
                 if config.api_key.starts_with("ENC:") {
                     match dpapi::decrypt_string(&config.api_key[4..]) {
                         Ok(decrypted) => config.api_key = decrypted,
@@ -215,6 +236,14 @@ fn load_config() -> AppConfig {
 fn save_config(config: AppConfig) -> Result<(), String> {
     let path = config_path();
     let mut save = config.clone();
+    // 向后兼容：同步 api_key 为当前活跃 provider 的 key
+    if save.api_key.is_empty() {
+        let active_key = save.provider_keys.get(&save.asr_provider)
+            .or_else(|| save.provider_keys.get(&save.polish_provider))
+            .cloned()
+            .unwrap_or_default();
+        save.api_key = active_key;
+    }
     if !save.api_key.is_empty() {
         let encrypted = dpapi::encrypt_string(&save.api_key).map_err(|e| e.to_string())?;
         save.api_key = format!("ENC:{}", encrypted);

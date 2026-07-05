@@ -4,6 +4,12 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { FileInfo, ApiConfig } from '../types'
 
+const PROVIDER_URLS: Record<string, string> = {
+  'mimo-api': 'https://api.xiaomimimo.com/v1',
+  'mimo-token-plan': 'https://token-plan-cn.xiaomimimo.com/v1',
+  'deepseek': 'https://api.deepseek.com',
+}
+
 interface RustConfig {
   provider: string
   base_url: string
@@ -14,6 +20,8 @@ interface RustConfig {
   polish_prompt: string
   provider_keys: Record<string, string>
   logging_enabled: boolean
+  asr_provider: string
+  polish_provider: string
 }
 
 interface FileProcessState {
@@ -50,6 +58,8 @@ export const useAppStore = defineStore('app', () => {
     polishPrompt: '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落',
     providerKeys: {},
     loggingEnabled: true,
+    asrProvider: 'mimo-api',
+    polishProvider: 'deepseek',
   })
 
   const fileStates = new Map<string, FileProcessState>()
@@ -99,6 +109,11 @@ export const useAppStore = defineStore('app', () => {
     files.value.some(f => f.status === 'transcribing' || f.status === 'processing')
   )
 
+  const asrKey = computed(() => apiConfig.value.providerKeys[apiConfig.value.asrProvider] || '')
+  const polishKey = computed(() => apiConfig.value.providerKeys[apiConfig.value.polishProvider] || '')
+  const asrBaseUrl = computed(() => PROVIDER_URLS[apiConfig.value.asrProvider] || PROVIDER_URLS['mimo-api'])
+  const polishBaseUrl = computed(() => PROVIDER_URLS[apiConfig.value.polishProvider] || PROVIDER_URLS['deepseek'])
+
   function showToastMessage(message: string, type: 'info' | 'error' | 'success' = 'info') {
     toastMessage.value = message
     toastType.value = type
@@ -118,6 +133,8 @@ export const useAppStore = defineStore('app', () => {
         polishPrompt: config.polish_prompt || '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落',
         providerKeys: config.provider_keys || {},
         loggingEnabled: config.logging_enabled ?? true,
+        asrProvider: config.asr_provider || 'mimo-api',
+        polishProvider: config.polish_provider || 'deepseek',
       }
       theme.value = (config.theme as 'system' | 'light' | 'dark') || 'system'
       applyTheme()
@@ -139,6 +156,8 @@ export const useAppStore = defineStore('app', () => {
           polish_prompt: apiConfig.value.polishPrompt,
           provider_keys: apiConfig.value.providerKeys,
           logging_enabled: apiConfig.value.loggingEnabled,
+          asr_provider: apiConfig.value.asrProvider,
+          polish_provider: apiConfig.value.polishProvider,
         }
       })
     } catch (e) {
@@ -412,6 +431,7 @@ export const useAppStore = defineStore('app', () => {
     files, selectedFileId, polishEnabledFileId, isPolishEnabled,
     isSettingsOpen, isTranscribing, apiConfig, statusInfo,
     selectedFile, completedCount, hasActiveFiles,
+    asrKey, polishKey, asrBaseUrl, polishBaseUrl,
     theme, toastMessage, toastType, showToast,
     showToastMessage, loadConfig, saveConfig, setTheme, applyTheme,
     addFile, removeFile, updateFile, selectFile, clearCompleted,

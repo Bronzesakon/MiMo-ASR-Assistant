@@ -5,8 +5,9 @@ import { ref, computed, reactive } from 'vue'
 import CustomSelect from './CustomSelect.vue'
 
 const store = useAppStore()
-const showKey = ref(false)
-const showHelp = reactive<Record<string, boolean>>({ key: false })
+const showAsrKey = ref(false)
+const showPolishKey = ref(false)
+const showHelp = reactive<Record<string, boolean>>({ asrKey: false, polishKey: false })
 
 function toggleHelp(id: string) {
   showHelp[id] = !showHelp[id]
@@ -14,8 +15,40 @@ function toggleHelp(id: string) {
 
 interface HelpLink { label: string; href: string }
 
-function getHelpLinks(): { text: string; links: HelpLink[] } {
-  const id = store.apiConfig.provider
+const asrProviders = [
+  { id: 'mimo-api', name: 'MiMo API', url: 'https://api.xiaomimimo.com/v1', prefix: 'sk-', keyLabel: 'MiMo API Key' },
+  { id: 'mimo-token-plan', name: 'MiMo Token Plan', url: 'https://token-plan-cn.xiaomimimo.com/v1', prefix: 'tp-', keyLabel: 'MiMo Token Plan Key' },
+]
+
+const polishProviders = [
+  { id: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com', prefix: 'sk-', keyLabel: 'DeepSeek API Key', chat: ['deepseek-v4-pro', 'deepseek-v4-flash'] },
+  { id: 'mimo-api', name: 'MiMo API', url: 'https://api.xiaomimimo.com/v1', prefix: 'sk-', keyLabel: 'MiMo API Key', chat: ['mimo-v2.5', 'mimo-v2.5-pro'] },
+  { id: 'mimo-token-plan', name: 'MiMo Token Plan', url: 'https://token-plan-cn.xiaomimimo.com/v1', prefix: 'tp-', keyLabel: 'MiMo Token Plan Key', chat: ['mimo-v2.5', 'mimo-v2.5-pro'] },
+]
+
+const currentAsrProv = computed(() => asrProviders.find(p => p.id === store.apiConfig.asrProvider) || asrProviders[0])
+const currentPolishProv = computed(() => polishProviders.find(p => p.id === store.apiConfig.polishProvider) || polishProviders[0])
+
+function getAsrHelpLinks(): { text: string; links: HelpLink[] } {
+  const id = store.apiConfig.asrProvider
+  if (id === 'mimo-token-plan') return {
+    text: 'MiMo Token Plan 为订阅制服务，API Key 是调用服务的身份凭证。前往 {0} 创建 API Key，{1} 查看额度。',
+    links: [
+      { label: 'Token Plan 管理', href: 'https://platform.xiaomimimo.com/console/plan-manage' },
+      { label: 'MiMo 控制台', href: 'https://platform.xiaomimimo.com/console/balance' }
+    ]
+  }
+  return {
+    text: 'MiMo API 为按量付费服务，API Key 是调用服务的身份凭证。前往 {0} 创建 API Key，{1} 查看余额。',
+    links: [
+      { label: 'MiMo API Keys', href: 'https://platform.xiaomimimo.com/console/api-keys' },
+      { label: 'MiMo 控制台', href: 'https://platform.xiaomimimo.com/console/balance' }
+    ]
+  }
+}
+
+function getPolishHelpLinks(): { text: string; links: HelpLink[] } {
+  const id = store.apiConfig.polishProvider
   if (id === 'mimo-api') return {
     text: 'MiMo API 为按量付费服务，API Key 是调用服务的身份凭证。前往 {0} 创建 API Key，{1} 查看余额。',
     links: [
@@ -39,24 +72,6 @@ function getHelpLinks(): { text: string; links: HelpLink[] } {
   }
 }
 
-const providers = [
-  { id: 'mimo-api', name: 'MiMo API', url: 'https://api.xiaomimimo.com/v1', prefix: 'sk-', keyLabel: 'MiMo API Key', asr: ['mimo-v2.5-asr'], chat: ['mimo-v2.5', 'mimo-v2.5-pro'] },
-  { id: 'mimo-token-plan', name: 'MiMo Token Plan', url: 'https://token-plan-cn.xiaomimimo.com/v1', prefix: 'tp-', keyLabel: 'MiMo Token Plan API Key', asr: ['mimo-v2.5-asr'], chat: ['mimo-v2.5', 'mimo-v2.5-pro'] },
-  { id: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com', prefix: 'sk-', keyLabel: 'DeepSeek API Key', asr: [], chat: ['deepseek-v4-pro', 'deepseek-v4-flash'] },
-]
-
-const prov = computed(() => providers.find(p => p.id === store.apiConfig.provider) || providers[0])
-
-// 当前服务商的 API Key（从 providerKeys 中读取）
-const currentKey = computed({
-  get: () => store.apiConfig.providerKeys[store.apiConfig.provider] || '',
-  set: (val: string) => {
-    store.apiConfig.providerKeys[store.apiConfig.provider] = val
-    // 同步到 apiKey（保持向后兼容）
-    store.apiConfig.apiKey = val
-  }
-})
-
 function getHelpContent(data: { text: string; links: HelpLink[] }): string {
   let result = data.text
   data.links.forEach((link, i) => {
@@ -73,18 +88,30 @@ function onToggleLogging(v: boolean) {
 
 function close() { store.isSettingsOpen = false; store.saveConfig() }
 
-function onProvider() {
-  store.apiConfig.baseUrl = prov.value.url
-  // 切换服务商时，从 providerKeys 读取对应的 key
-  store.apiConfig.apiKey = store.apiConfig.providerKeys[prov.value.id] || ''
-  if (!prov.value.asr.includes(store.apiConfig.transcriptionModel)) store.apiConfig.transcriptionModel = prov.value.asr[0] || ''
-  if (!prov.value.chat.includes(store.apiConfig.polishModel)) store.apiConfig.polishModel = prov.value.chat[0]
+function onAsrProviderChange(v: string) {
+  store.apiConfig.asrProvider = v
   store.saveConfig()
 }
 
-function onKeyChange() {
-  // 保存当前 key 到 providerKeys
-  store.apiConfig.providerKeys[store.apiConfig.provider] = currentKey.value
+function onPolishProviderChange(v: string) {
+  store.apiConfig.polishProvider = v
+  const prov = polishProviders.find(p => p.id === v)
+  if (prov && !prov.chat.includes(store.apiConfig.polishModel)) {
+    store.apiConfig.polishModel = prov.chat[0]
+  }
+  store.saveConfig()
+}
+
+function onPolishModelChange(v: string) {
+  store.apiConfig.polishModel = v
+  store.saveConfig()
+}
+
+function onAsrKeyChange() {
+  store.saveConfig()
+}
+
+function onPolishKeyChange() {
   store.saveConfig()
 }
 
@@ -118,25 +145,76 @@ function openLogDir() {
             </div>
           </div>
 
+          <!-- 转文字 -->
+          <div class="section-divider"><span>转文字</span></div>
+
           <div class="field">
-            <label class="label">服务商</label>
+            <label class="label">转写模型</label>
+            <input class="input input-readonly" value="MiMo-V2.5-ASR" readonly />
+            <div class="hint-box">
+              <p class="hint-text">固定使用 MiMo-V2.5-ASR 模型进行语音转写</p>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="label">转写服务商</label>
             <CustomSelect
-              :model-value="store.apiConfig.provider"
-              :options="providers.map(p => ({ value: p.id, label: p.name }))"
-              @update:model-value="(v: string) => { store.apiConfig.provider = v; onProvider() }"
+              :model-value="store.apiConfig.asrProvider"
+              :options="asrProviders.map(p => ({ value: p.id, label: p.name }))"
+              @update:model-value="onAsrProviderChange"
             />
           </div>
 
           <div class="field">
-            <label class="label">{{ prov.keyLabel }}</label>
+            <label class="label">{{ currentAsrProv.keyLabel }}</label>
             <div class="key-row">
-              <input v-model="currentKey" :type="showKey ? 'text' : 'password'" class="input" :placeholder="prov.prefix + '...'" @change="onKeyChange" />
-              <button class="key-toggle" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button>
+              <input
+                :value="store.apiConfig.providerKeys[store.apiConfig.asrProvider] || ''"
+                @input="(e: Event) => { store.apiConfig.providerKeys[store.apiConfig.asrProvider] = (e.target as HTMLInputElement).value }"
+                :type="showAsrKey ? 'text' : 'password'"
+                class="input"
+                :placeholder="currentAsrProv.prefix + '...'"
+                @change="onAsrKeyChange"
+              />
+              <button class="key-toggle" @click="showAsrKey = !showAsrKey">{{ showAsrKey ? '隐藏' : '显示' }}</button>
             </div>
-            <button class="hint-trigger" @click="toggleHelp('key')">这是什么？</button>
+            <button class="hint-trigger" @click="toggleHelp('asrKey')">这是什么？</button>
             <Transition name="hint-expand">
-              <div v-if="showHelp.key" class="hint-box">
-                <p class="hint-text" v-html="getHelpContent(getHelpLinks())"></p>
+              <div v-if="showHelp.asrKey" class="hint-box">
+                <p class="hint-text" v-html="getHelpContent(getAsrHelpLinks())"></p>
+              </div>
+            </Transition>
+          </div>
+
+          <!-- 规整 -->
+          <div class="section-divider"><span>规整</span></div>
+
+          <div class="field">
+            <label class="label">规整服务商</label>
+            <CustomSelect
+              :model-value="store.apiConfig.polishProvider"
+              :options="polishProviders.map(p => ({ value: p.id, label: p.name }))"
+              @update:model-value="onPolishProviderChange"
+            />
+          </div>
+
+          <div class="field">
+            <label class="label">{{ currentPolishProv.keyLabel }}</label>
+            <div class="key-row">
+              <input
+                :value="store.apiConfig.providerKeys[store.apiConfig.polishProvider] || ''"
+                @input="(e: Event) => { store.apiConfig.providerKeys[store.apiConfig.polishProvider] = (e.target as HTMLInputElement).value }"
+                :type="showPolishKey ? 'text' : 'password'"
+                class="input"
+                :placeholder="currentPolishProv.prefix + '...'"
+                @change="onPolishKeyChange"
+              />
+              <button class="key-toggle" @click="showPolishKey = !showPolishKey">{{ showPolishKey ? '隐藏' : '显示' }}</button>
+            </div>
+            <button class="hint-trigger" @click="toggleHelp('polishKey')">这是什么？</button>
+            <Transition name="hint-expand">
+              <div v-if="showHelp.polishKey" class="hint-box">
+                <p class="hint-text" v-html="getHelpContent(getPolishHelpLinks())"></p>
               </div>
             </Transition>
           </div>
@@ -145,8 +223,8 @@ function openLogDir() {
             <label class="label">规整模型</label>
             <CustomSelect
               :model-value="store.apiConfig.polishModel"
-              :options="prov.chat.map(m => ({ value: m, label: m }))"
-              @update:model-value="(v: string) => { store.apiConfig.polishModel = v; store.saveConfig() }"
+              :options="currentPolishProv.chat.map(m => ({ value: m, label: m }))"
+              @update:model-value="onPolishModelChange"
             />
           </div>
 
@@ -302,6 +380,13 @@ function openLogDir() {
 .select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(110, 158, 255, 0.15);
+}
+
+.input-readonly {
+  color: var(--text-tertiary);
+  cursor: default;
+  background: var(--bg-hover);
+  border-color: var(--border-subtle);
 }
 
 .key-row {
@@ -499,5 +584,29 @@ function openLogDir() {
 .hint-expand-leave-from {
   opacity: 1;
   max-height: 120px;
+}
+
+.section-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+.section-divider::before,
+.section-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-default);
+}
+
+.section-divider span {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
 }
 </style>
