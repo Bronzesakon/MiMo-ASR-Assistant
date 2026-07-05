@@ -34,12 +34,6 @@ impl api::Emitter for TauriEmitter {
     }
 }
 
-impl api::Emitter for Arc<TauriEmitter> {
-    fn emit(&self, event: &str, payload: &str) -> Result<(), String> {
-        self.handle.emit(event, payload).map_err(|e| e.to_string())
-    }
-}
-
 /// 带 file_id 标签的事件发射器，所有 emit 自动携带 file_id
 struct TaggedEmitter {
     handle: AppHandle,
@@ -153,7 +147,7 @@ fn default_asr_provider() -> String { "mimo-api".to_string() }
 fn default_polish_provider() -> String { "deepseek".to_string() }
 
 fn default_polish_prompt() -> String {
-    "给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落".to_string()
+    "给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，优化每句话的口语化表达的语气词、重复字等，要求只做修饰，每句话都要输出，不可简略，不可概括，根据原文的内容，智能切分长段落".to_string()
 }
 
 impl Default for AppConfig {
@@ -335,8 +329,6 @@ async fn process_and_transcribe(
         "file_id": file_id, "stage": "分片中"
     }).to_string());
 
-    let start_time = std::time::Instant::now();
-
     // 逐片接收并立即发送 API
     while let Some((index, total, data_url)) = rx.as_mut().unwrap().recv().await {
         // 检查是否已取消
@@ -355,7 +347,6 @@ async fn process_and_transcribe(
         // 获取速率许可
         let _permit = limiter.0.acquire_permit().await;
 
-        let slice_start = std::time::Instant::now();
         let mut last_error = None;
 
         for attempt in 1..=3u32 {
@@ -378,15 +369,6 @@ async fn process_and_transcribe(
             let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
             return Err(e.to_string());
         }
-
-        let slice_ms = slice_start.elapsed().as_millis();
-        let elapsed_s = start_time.elapsed().as_secs_f64();
-        let upload_speed = if slice_ms > 0 { (data_url.len() as f64 / slice_ms as f64) * 1000.0 } else { 0.0 };
-        let status_json = serde_json::json!({
-            "file_id": file_id, "slice": index, "total": total,
-            "elapsed": elapsed_s, "upload_speed": upload_speed,
-        });
-        let _ = plain_emitter.emit("status-update", &status_json.to_string());
     }
 
     // 等待 blocking task 完成
@@ -412,115 +394,6 @@ async fn process_and_transcribe(
     audio::cleanup_temp(&temp_dir);
 
     info!("[{}] process_and_transcribe 完成", file_name);
-    Ok(())
-}
-
-/// 流式转写音频（携带 file_id 做事件隔离，使用速率控制器）
-#[tauri::command]
-async fn start_transcription(
-    handle: AppHandle,
-    file_id: String,
-    file_name: String,
-    audio_data_urls: Vec<String>,
-    api_params: ApiParams,
-) -> Result<(), String> {
-    let total = audio_data_urls.len();
-    info!("[{}] start_transcription 开始: {} 个片段", file_name, total);
-
-    let config: api::ApiConfig = api_params.into();
-    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
-    let plain_emitter = TauriEmitter { handle: handle.clone() };
-    let limiter = handle.state::<rate_limiter::AsrRateLimiter>();
-
-    // 注册取消句柄
-    let cancelled = Arc::new(AtomicBool::new(false));
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle { cancelled: cancelled.clone() });
-    }
-
-    if total == 0 {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.remove(&file_id);
-        return Ok(());
-    }
-
-    let start_time = std::time::Instant::now();
-
-    for (i, data_url) in audio_data_urls.iter().enumerate() {
-        if cancelled.load(Ordering::Acquire) { break; }
-
-        let progress_json = serde_json::json!({
-            "file_id": file_id,
-            "current": i + 1,
-            "total": total,
-        });
-        let _ = plain_emitter.emit("transcription-progress", &progress_json.to_string());
-
-        let slice_start = std::time::Instant::now();
-
-        // 获取速率许可（等待并发槽位 + RPM 余量）
-        let _permit = limiter.0.acquire_permit().await;
-
-        let mut last_error = None;
-        let max_retries = 3;
-
-        for attempt in 1..=max_retries {
-            if attempt > 1 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-
-            match api::stream_transcription(data_url, &config, &tagged_emitter, &cancelled).await {
-                Ok(_) => {
-                    last_error = None;
-                    break;
-                }
-                Err(e) => {
-                    warn!("[{}] 片段 {} 尝试 {} 失败: {}", file_name, i + 1, attempt, e);
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        if let Some(e) = last_error {
-            error!("[{}] 片段 {} 最终失败 (已重试 {} 次): {}", file_id, i + 1, max_retries, e);
-            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-            return Err(e.to_string());
-        }
-
-        let slice_ms = slice_start.elapsed().as_millis();
-        let elapsed_s = start_time.elapsed().as_secs_f64();
-        let upload_bytes = data_url.len();
-        let upload_speed = if slice_ms > 0 {
-            (upload_bytes as f64 / slice_ms as f64) * 1000.0
-        } else {
-            0.0
-        };
-        let status_json = serde_json::json!({
-            "file_id": file_id,
-            "slice": i + 1,
-            "total": total,
-            "elapsed": elapsed_s,
-            "upload_speed": upload_speed,
-        });
-        let _ = plain_emitter.emit("status-update", &status_json.to_string());
-    }
-
-    let is_cancelled = cancelled.load(Ordering::Acquire);
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.remove(&file_id);
-    }
-
-    if is_cancelled {
-        info!("[{}] start_transcription 已取消", file_name);
-        return Ok(());
-    }
-
-    let complete_json = serde_json::json!({ "file_id": file_id });
-    let _ = plain_emitter.emit("transcription-complete", &complete_json.to_string());
-    info!("[{}] start_transcription 全部完成", file_name);
     Ok(())
 }
 
@@ -735,7 +608,6 @@ pub fn run() {
         .manage(TaskRegistry { tasks: tokio::sync::Mutex::new(HashMap::new()) })
         .invoke_handler(tauri::generate_handler![
             process_and_transcribe,
-            start_transcription,
             start_chat,
             cancel_task,
             save_file,

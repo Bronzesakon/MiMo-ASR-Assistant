@@ -27,8 +27,6 @@ interface RustConfig {
 interface FileProcessState {
   transcribeStartTime: number
   outputCharCount: number
-  uploadSpeedSum: number
-  uploadSpeedCount: number
   totalSlices: number
   currentSlice: number
   transcriptionChunks: number
@@ -40,7 +38,6 @@ export const useAppStore = defineStore('app', () => {
   const files = ref<FileInfo[]>([])
   const selectedFileId = ref<string | null>(null)
 
-  const polishEnabledFileId = ref<string | null>(null)
   const isSettingsOpen = ref(false)
   const isTranscribing = ref(false)
   const toastMessage = ref('')
@@ -55,7 +52,7 @@ export const useAppStore = defineStore('app', () => {
     apiKey: '',
     transcriptionModel: 'mimo-v2.5-asr',
     polishModel: 'mimo-v2.5',
-    polishPrompt: '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落',
+    polishPrompt: '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，优化每句话的口语化表达的语气词、重复字等，要求只做修饰，每句话都要输出，不可简略，不可概括，根据原文的内容，智能切分长段落',
     providerKeys: {},
     loggingEnabled: true,
     asrProvider: 'mimo-api',
@@ -66,16 +63,12 @@ export const useAppStore = defineStore('app', () => {
 
   const statusInfo = computed(() => {
     void speedTick.value // 每秒强制重算输出速度
-    let totalUploadSpeed = 0
     let totalOutputSpeed = 0
 
     for (const [fileId, state] of fileStates) {
       const file = files.value.find(f => f.id === fileId)
       if (!file || (file.status !== 'transcribing' && file.status !== 'processing')) continue
 
-      if (state.uploadSpeedCount > 0) {
-        totalUploadSpeed += state.uploadSpeedSum / state.uploadSpeedCount
-      }
       if (state.transcribeStartTime > 0) {
         const elapsed = (Date.now() - state.transcribeStartTime) / 1000
         if (elapsed > 0) totalOutputSpeed += Math.round(state.outputCharCount / elapsed)
@@ -84,7 +77,6 @@ export const useAppStore = defineStore('app', () => {
 
     return {
       modelName: apiConfig.value.transcriptionModel,
-      uploadSpeed: totalUploadSpeed,
       outputSpeed: totalOutputSpeed,
       tokenCount: globalTokenCount.value,
     }
@@ -95,10 +87,6 @@ export const useAppStore = defineStore('app', () => {
 
   const selectedFile = computed(() =>
     files.value.find(f => f.id === selectedFileId.value) || null
-  )
-
-  const isPolishEnabled = computed(() =>
-    polishEnabledFileId.value === selectedFileId.value
   )
 
   const completedCount = computed(() =>
@@ -128,9 +116,9 @@ export const useAppStore = defineStore('app', () => {
         provider: config.provider,
         baseUrl: config.base_url,
         apiKey: config.api_key,
-        transcriptionModel: config.transcription_model,
-        polishModel: config.polish_model,
-        polishPrompt: config.polish_prompt || '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落',
+        transcriptionModel: config.transcription_model || 'mimo-v2.5-asr',
+        polishModel: config.polish_model || 'mimo-v2.5',
+        polishPrompt: config.polish_prompt || '给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，优化每句话的口语化表达的语气词、重复字等，要求只做修饰，每句话都要输出，不可简略，不可概括，根据原文的内容，智能切分长段落',
         providerKeys: config.provider_keys || {},
         loggingEnabled: config.logging_enabled ?? true,
         asrProvider: config.asr_provider || 'mimo-api',
@@ -200,7 +188,6 @@ export const useAppStore = defineStore('app', () => {
       files.value.splice(index, 1)
       fileStates.delete(id)
       if (selectedFileId.value === id) selectedFileId.value = files.value[0]?.id || null
-      if (polishEnabledFileId.value === id) polishEnabledFileId.value = null
     }
   }
 
@@ -210,15 +197,6 @@ export const useAppStore = defineStore('app', () => {
   }
 
   function selectFile(id: string) { selectedFileId.value = id }
-  function clearCompleted() { files.value = files.value.filter(f => f.status !== 'completed') }
-
-  function setPolishEnabled(enabled: boolean) {
-    if (enabled && selectedFileId.value) {
-      polishEnabledFileId.value = selectedFileId.value
-    } else {
-      polishEnabledFileId.value = null
-    }
-  }
 
   function resetStatus() {
     globalTokenCount.value = 0
@@ -243,7 +221,6 @@ export const useAppStore = defineStore('app', () => {
     if (!state) {
       state = {
         transcribeStartTime: 0, outputCharCount: 0,
-        uploadSpeedSum: 0, uploadSpeedCount: 0,
         totalSlices: 0, currentSlice: 0,
         transcriptionChunks: 0,
         polishChunkCount: 0, polishFirstChunk: false,
@@ -383,19 +360,6 @@ export const useAppStore = defineStore('app', () => {
       }
     }).then(fn => unlistenFns.push(fn))
 
-    // 上传速度
-    listen<string>('status-update', (event) => {
-      try {
-        const data = JSON.parse(event.payload)
-        const fileId = data.file_id
-        const state = ensureFileState(fileId)
-        if (data.upload_speed) {
-          state.uploadSpeedSum += data.upload_speed
-          state.uploadSpeedCount++
-        }
-      } catch {}
-    }).then(fn => unlistenFns.push(fn))
-
     // Token 统计
     listen<string>('token-update', (event) => {
       try {
@@ -406,10 +370,6 @@ export const useAppStore = defineStore('app', () => {
         const tokens = parseInt(event.payload, 10)
         if (!isNaN(tokens)) globalTokenCount.value += tokens
       }
-    }).then(fn => unlistenFns.push(fn))
-
-    // 处理阶段状态
-    listen<string>('process-status', (_event) => {
     }).then(fn => unlistenFns.push(fn))
 
     // 每秒刷新输出速度
@@ -428,14 +388,14 @@ export const useAppStore = defineStore('app', () => {
   }
 
   return {
-    files, selectedFileId, polishEnabledFileId, isPolishEnabled,
+    files, selectedFileId,
     isSettingsOpen, isTranscribing, apiConfig, statusInfo,
     selectedFile, completedCount, hasActiveFiles,
     asrKey, polishKey, asrBaseUrl, polishBaseUrl,
     theme, toastMessage, toastType, showToast,
     showToastMessage, loadConfig, saveConfig, setTheme, applyTheme,
-    addFile, removeFile, updateFile, selectFile, clearCompleted,
-    setPolishEnabled, resetStatus, ensureFileState, fileStates,
+    addFile, removeFile, updateFile, selectFile,
+    resetStatus, ensureFileState, fileStates,
     requestCancelFile, speedTick,
   }
 })

@@ -88,3 +88,4 @@ cd src-tauri && cargo check
 - [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code) — MiMo API 参考实现
 - [Joyi-code/DeepSeekMonitorWindows](https://github.com/KerryChia/DeepSeek_Monitor_for_Windows) — 系统托盘与窗口管理参考
 - [KerryChia/DeepSeek_Monitor_for_Windows](https://github.com/Joyi-code/DeepSeekMonitorWindows/commit/ce26946cfc09dfd08a91367bf42578fe02dc0445) — 托盘点击首次唤出窗口修复
+- [Marked](https://github.com/markedjs/marked) — Markdown 渲染（MIT License）

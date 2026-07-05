@@ -6,7 +6,8 @@ import { markdownToHtml } from '../utils/markdown'
 const store = useAppStore()
 const textRef = ref<HTMLElement | null>(null)
 const polishRef = ref<HTMLElement | null>(null)
-const autoScroll = ref(true)
+const autoScrollOriginal = ref(true)
+const autoScrollPolished = ref(true)
 const copiedOriginal = ref(false)
 const copiedPolished = ref(false)
 
@@ -29,28 +30,57 @@ const hasPolished = computed(() =>
   (store.selectedFile?.polished?.length ?? 0) > 0
 )
 
-watch(() => store.selectedFileId, () => { autoScroll.value = true })
+function isAtBottom(el: HTMLElement): boolean {
+  return Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 60
+}
+
+// 切换文件时重置两个面板
+watch(() => store.selectedFileId, () => {
+  autoScrollOriginal.value = true
+  autoScrollPolished.value = true
+})
+
+// 单栏↔双栏切换时，根据实际 scrollTop 重新判定追踪状态
+watch(showDualPanel, () => {
+  nextTick(() => {
+    if (textRef.value) autoScrollOriginal.value = isAtBottom(textRef.value)
+    if (polishRef.value) autoScrollPolished.value = isAtBottom(polishRef.value)
+  })
+})
+
+// 转写内容变化 → 追踪原文面板
 watch(() => store.selectedFile?.transcription, () => {
-  if (autoScroll.value) nextTick(() => textRef.value && (textRef.value.scrollTop = textRef.value.scrollHeight))
+  if (autoScrollOriginal.value) nextTick(() => textRef.value && (textRef.value.scrollTop = textRef.value.scrollHeight))
 })
+
+// 规整内容变化 → 追踪规整面板
 watch(() => store.selectedFile?.polished, () => {
-  if (autoScroll.value) nextTick(() => polishRef.value && (polishRef.value.scrollTop = polishRef.value.scrollHeight))
+  if (autoScrollPolished.value) nextTick(() => polishRef.value && (polishRef.value.scrollTop = polishRef.value.scrollHeight))
 })
 
-function onScroll() {
-  const el = textRef.value
-  if (el) autoScroll.value = Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 60
+function onScrollOriginal() {
+  if (textRef.value) autoScrollOriginal.value = isAtBottom(textRef.value)
 }
 
-function onWheel(e: WheelEvent) {
-  if (e.deltaY < 0 && (e.target as HTMLElement)?.closest?.('.ws-body')?.contains(textRef.value)) {
-    autoScroll.value = false
-  }
+function onScrollPolished() {
+  if (polishRef.value) autoScrollPolished.value = isAtBottom(polishRef.value)
 }
 
-function goBottom() {
-  autoScroll.value = true
+function onWheelOriginal(e: WheelEvent) {
+  if (e.deltaY < 0) autoScrollOriginal.value = false
+}
+
+function onWheelPolished(e: WheelEvent) {
+  if (e.deltaY < 0) autoScrollPolished.value = false
+}
+
+function goBottomOriginal() {
+  autoScrollOriginal.value = true
   textRef.value && (textRef.value.scrollTop = textRef.value.scrollHeight)
+}
+
+function goBottomPolished() {
+  autoScrollPolished.value = true
   polishRef.value && (polishRef.value.scrollTop = polishRef.value.scrollHeight)
 }
 
@@ -73,7 +103,7 @@ async function copyText(type: 'original' | 'polished') {
 </script>
 
 <template>
-  <div class="workspace" @wheel="onWheel">
+  <div class="workspace">
     <!-- 空状态 -->
     <div v-if="!store.selectedFile" class="ws-empty">
       <div class="ws-empty-content">
@@ -94,12 +124,12 @@ async function copyText(type: 'original' | 'polished') {
           <button v-if="hasOriginal" class="ws-btn" :class="{ copied: copiedOriginal }" @click="copyText('original')">
             {{ copiedOriginal ? '已复制' : '复制' }}
           </button>
-          <button v-if="hasOriginal && store.selectedFile?.status === 'transcribing' && !autoScroll" class="ws-btn" @click="goBottom">
+          <button v-if="hasOriginal && !autoScrollOriginal" class="ws-btn" @click="goBottomOriginal">
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M2 6l3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
       </div>
-      <div ref="textRef" class="ws-body" @scroll="onScroll">
+      <div ref="textRef" class="ws-body" @scroll="onScrollOriginal" @wheel="onWheelOriginal">
         <div v-if="store.selectedFile.transcription" class="ws-text">{{ store.selectedFile.transcription }}</div>
         <div v-else class="ws-hint">
           <template v-if="store.selectedFile.status === 'waiting'">点击左侧"转写"按钮开始</template>
@@ -121,12 +151,12 @@ async function copyText(type: 'original' | 'polished') {
             <button v-if="hasOriginal" class="ws-btn" :class="{ copied: copiedOriginal }" @click="copyText('original')">
               {{ copiedOriginal ? '已复制' : '复制' }}
             </button>
-            <button v-if="hasOriginal && store.selectedFile?.status === 'transcribing' && !autoScroll" class="ws-btn" @click="goBottom">
+            <button v-if="hasOriginal && !autoScrollOriginal" class="ws-btn" @click="goBottomOriginal">
               <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M2 6l3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
           </div>
         </div>
-        <div ref="textRef" class="ws-body" @scroll="onScroll">
+        <div ref="textRef" class="ws-body" @scroll="onScrollOriginal" @wheel="onWheelOriginal">
           <div v-if="store.selectedFile.transcription" class="ws-text md-content" v-html="renderMd(store.selectedFile.transcription)"></div>
           <div v-else class="ws-hint">暂无内容</div>
         </div>
@@ -140,9 +170,12 @@ async function copyText(type: 'original' | 'polished') {
             <button v-if="hasPolished" class="ws-btn" :class="{ copied: copiedPolished }" @click="copyText('polished')">
               {{ copiedPolished ? '已复制' : '复制' }}
             </button>
+            <button v-if="hasPolished && !autoScrollPolished" class="ws-btn" @click="goBottomPolished">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M2 6l3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
           </div>
         </div>
-        <div ref="polishRef" class="ws-body">
+        <div ref="polishRef" class="ws-body" @scroll="onScrollPolished" @wheel="onWheelPolished">
           <div v-if="store.selectedFile.polished" class="ws-text md-content" v-html="renderMd(store.selectedFile.polished)"></div>
           <div v-else class="ws-hint">
             <template v-if="store.selectedFile.status === 'polishing'">{{ (store.selectedFile as any).polishStage === 'sending' ? '发送中…' : (store.selectedFile as any).polishStage === 'receiving' ? '接收中…' : '规整中…' }}</template>

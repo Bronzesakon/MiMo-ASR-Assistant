@@ -140,8 +140,6 @@ async function transcribeFile(fileId: string, language: string) {
   const state = store.ensureFileState(fileId)
   state.transcribeStartTime = Date.now()
   state.outputCharCount = 0
-  state.uploadSpeedSum = 0
-  state.uploadSpeedCount = 0
   state.totalSlices = 0
   state.currentSlice = 0
 
@@ -168,7 +166,7 @@ async function transcribeFile(fileId: string, language: string) {
   store.isTranscribing = store.hasActiveFiles
 }
 
-const POLISH_PROMPT = `给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，去掉口语化表达的语气词，要求只对每句话做修饰，每句话都要输出，不简略，根据原文的内容，智能切分长段落`
+const POLISH_PROMPT = `给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，优化每句话的口语化表达的语气词、重复字等，要求只做修饰，每句话都要输出，不可简略，不可概括，根据原文的内容，智能切分长段落`
 
 async function polishFile(fileId: string) {
   closeAllDropdowns()
@@ -179,7 +177,6 @@ async function polishFile(fileId: string) {
 
   console.log(`[规整] 开始: ${file.name}, 文本长度=${file.transcription.length}`)
 
-  store.polishEnabledFileId = fileId
   store.selectFile(fileId)
   store.updateFile(fileId, {
     polished: '', polishedWordCount: 0,

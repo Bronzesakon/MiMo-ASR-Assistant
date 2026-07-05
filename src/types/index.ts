@@ -31,6 +31,5 @@ export interface ProviderInfo {
   id: string
   name: string
   baseUrl: string
-  defaultModel: string
   keyPrefix: string
 }

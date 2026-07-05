@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub enum ServiceProvider {
     MimoApi,
     MimoTokenPlan,
-    DeepSeek,
 }
 
 impl std::fmt::Display for ServiceProvider {
@@ -12,7 +11,6 @@ impl std::fmt::Display for ServiceProvider {
         match self {
             ServiceProvider::MimoApi => write!(f, "MiMo API"),
             ServiceProvider::MimoTokenPlan => write!(f, "MiMo Token Plan"),
-            ServiceProvider::DeepSeek => write!(f, "DeepSeek"),
         }
     }
 }
