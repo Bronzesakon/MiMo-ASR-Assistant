@@ -42,12 +42,13 @@ src-tauri/icons/StoreLogo.png
 .agents/
 .reasonix/
 
-# Temp
+# Non-source files (docs, configs, release notes)
 *.tmp
 *.temp
+.npmrc
+reasonix.toml
 API接口规范文档.md
 CLAUDE.md
 项目文档.md
-transcribe.py
-/Mimo.code-workspace
+RELEASE_v1.1.0.md
 skills-lock.json
