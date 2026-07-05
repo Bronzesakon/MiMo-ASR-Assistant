@@ -287,11 +287,16 @@ async fn process_and_transcribe(
     }).to_string());
 
     // channel：blocking task → async context，缓冲 8 个分片
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u32, u32, String)>(8);
+    let (tx, rx) = tokio::sync::mpsc::channel::<(u32, u32, String)>(8);
+    let mut rx = Some(rx);
+
+    // 临时目录由本函数管理，确保取消时也能清理
+    let temp_dir = audio::unique_temp_dir();
 
     // 在阻塞线程中执行切片，每切完一片通过 channel 发送
+    let slice_temp_dir = temp_dir.clone();
     let blocking_task = tokio::task::spawn_blocking(move || {
-        audio::convert_and_slice(&path, None, &|index, total, data_url| {
+        audio::convert_and_slice(&path, &slice_temp_dir, None, &|index, total, data_url| {
             let _ = tx.blocking_send((index, total, data_url));
         })
     });
@@ -304,9 +309,11 @@ async fn process_and_transcribe(
     let start_time = std::time::Instant::now();
 
     // 逐片接收并立即发送 API
-    while let Some((index, total, data_url)) = rx.recv().await {
+    while let Some((index, total, data_url)) = rx.as_mut().unwrap().recv().await {
         // 检查是否已取消
         if cancelled.load(Ordering::Acquire) {
+            // 立即关闭 channel，通知 blocking task 停止切片
+            rx.take();
             break;
         }
 
@@ -364,12 +371,17 @@ async fn process_and_transcribe(
     }
 
     if is_cancelled {
+        audio::cleanup_temp(&temp_dir);
         info!("[{}] process_and_transcribe 已取消", file_name);
         return Ok(());
     }
 
     let complete_json = serde_json::json!({ "file_id": file_id });
     let _ = plain_emitter.emit("transcription-complete", &complete_json.to_string());
+
+    // 转写完成，清理临时目录
+    audio::cleanup_temp(&temp_dir);
+
     info!("[{}] process_and_transcribe 完成", file_name);
     Ok(())
 }

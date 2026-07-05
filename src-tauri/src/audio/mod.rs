@@ -37,7 +37,7 @@ impl From<std::io::Error> for AudioError {
 }
 
 /// 生成唯一临时目录（避免并发冲突）
-fn unique_temp_dir() -> std::path::PathBuf {
+pub fn unique_temp_dir() -> std::path::PathBuf {
     let id = format!("{}_{}", std::process::id(), std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -47,16 +47,20 @@ fn unique_temp_dir() -> std::path::PathBuf {
 
 /// 将音频文件转换为 WAV 并切分，通过回调逐片返回 Base64 data URL
 /// callback 参数：(当前分片序号, 总分片估算, data_url)
+/// temp_dir 由调用方创建和管理，本函数不再负责清理
 pub fn convert_and_slice(
     input_path: &Path,
+    temp_dir: &Path,
     _slice_seconds: Option<u32>,
     callback: &dyn Fn(u32, u32, String),
 ) -> Result<usize, AudioError> {
-    info!("convert_and_slice 开始: {:?}", input_path);
+    let file_name = input_path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    info!("[{}] convert_and_slice 开始: {:?}", file_name, input_path);
 
-    let temp_dir = unique_temp_dir();
-    std::fs::create_dir_all(&temp_dir)?;
-    info!("临时目录: {:?}", temp_dir);
+    std::fs::create_dir_all(temp_dir)?;
+    info!("[{}] 临时目录: {:?}", file_name, temp_dir);
 
     // 检查是否已经是目标格式
     let info_result = ffmpeg::get_audio_info(input_path);
@@ -67,45 +71,44 @@ pub fn convert_and_slice(
                 && audio_info.channels == 1
                 && audio_info.bits_per_sample == 16;
             if is_target {
-                info!("音频已是目标格式 (16kHz/mono/16bit WAV)，跳过转码");
+                info!("[{}] 音频已是目标格式 (16kHz/mono/16bit WAV)，跳过转码", file_name);
             } else {
-                info!("音频格式: codec={}, {}Hz, {}ch, {}bit，需要转码",
-                    audio_info.codec, audio_info.sample_rate, audio_info.channels, audio_info.bits_per_sample);
+                info!("[{}] 音频格式: codec={}, {}Hz, {}ch, {}bit，需要转码",
+                    file_name, audio_info.codec, audio_info.sample_rate, audio_info.channels, audio_info.bits_per_sample);
             }
             !is_target
         }
         Err(e) => {
-            warn!("无法获取音频信息: {}，尝试转码", e);
+            warn!("[{}] 无法获取音频信息: {}，尝试转码", file_name, e);
             true
         }
     };
 
     let wav_path = if needs_conversion {
-        info!("开始转码...");
+        info!("[{}] 开始转码...", file_name);
         let out = temp_dir.join("converted.wav");
         ffmpeg::convert_to_wav(input_path, &out)?;
-        info!("转码完成");
+        info!("[{}] 转码完成", file_name);
         out
     } else {
         // 直接使用原文件，复制到临时目录以避免路径问题
         let out = temp_dir.join("converted.wav");
         std::fs::copy(input_path, &out)?;
-        info!("已复制原文件到临时目录");
+        info!("[{}] 已复制原文件到临时目录", file_name);
         out
     };
 
     // 获取时长
     let total_duration = ffmpeg::get_duration(&wav_path)?;
-    info!("音频时长: {:.1}s", total_duration);
+    info!("[{}] 音频时长: {:.1}s", file_name, total_duration);
 
     if total_duration <= 0.0 {
-        error!("音频时长为 0");
-        cleanup_temp(&temp_dir);
+        error!("[{}] 音频时长为 0", file_name);
         return Err(AudioError::EncodingError("音频时长为 0".to_string()));
     }
 
     // 动态切割
-    info!("开始分片...");
+    info!("[{}] 开始分片...", file_name);
     // 估算总分片数（用于前端进度条）
     let estimated_total = ((total_duration / MAX_CHUNK_SECONDS as f64).ceil() as u32).max(1);
     let mut current_time = 0.0;
@@ -119,14 +122,14 @@ pub fn convert_and_slice(
         }
         let mut this_sec = (chunk_sec as f64).min(remaining);
 
-        info!("分片 {}: {:.0}s-{:.0}s ({:.1}s)", chunk_index + 1, current_time, current_time + this_sec, this_sec);
+        info!("[{}] 分片 {}: {:.0}s-{:.0}s ({:.1}s)", file_name, chunk_index + 1, current_time, current_time + this_sec, this_sec);
 
         let mut slice_path;
         let mut audio_bytes;
         let mut b64_len;
 
         loop {
-            slice_path = ffmpeg::slice_wav(&wav_path, &temp_dir, current_time, this_sec)?;
+            slice_path = ffmpeg::slice_wav(&wav_path, temp_dir, current_time, this_sec)?;
             audio_bytes = std::fs::read(&slice_path)?;
             b64_len = base64_encoded_len(audio_bytes.len());
 
@@ -136,13 +139,12 @@ pub fn convert_and_slice(
 
             this_sec -= CHUNK_SHRINK_STEP as f64;
             if this_sec < MIN_CHUNK_SECONDS as f64 {
-                error!("分片 {} 缩至 {:.1}s 仍超限 ({:.1}MB)", chunk_index, this_sec, b64_len as f64 / 1024.0 / 1024.0);
-                cleanup_temp(&temp_dir);
+                error!("[{}] 分片 {} 缩至 {:.1}s 仍超限 ({:.1}MB)", file_name, chunk_index, this_sec, b64_len as f64 / 1024.0 / 1024.0);
                 return Err(AudioError::EncodingError(
                     format!("分片 {} 缩至 {:.1}s 仍超限 ({:.1}MB)", chunk_index, this_sec, b64_len as f64 / 1024.0 / 1024.0)
                 ));
             }
-            warn!("分片 {} Base64={:.1}MB 超限，缩短至 {:.1}s", chunk_index, b64_len as f64 / 1024.0 / 1024.0, this_sec);
+            warn!("[{}] 分片 {} Base64={:.1}MB 超限，缩短至 {:.1}s", file_name, chunk_index, b64_len as f64 / 1024.0 / 1024.0, this_sec);
         }
 
         let base64_str = base64_encode(&audio_bytes);
@@ -152,23 +154,31 @@ pub fn convert_and_slice(
         // 释放原始音频字节
         drop(audio_bytes);
 
-        info!("分片 {} 完成: {:.0}KB", chunk_index + 1, b64_len as f64 / 1024.0);
+        info!("[{}] 分片 {} 完成: {:.0}KB", file_name, chunk_index + 1, b64_len as f64 / 1024.0);
 
         current_time += this_sec;
         chunk_index += 1;
         chunk_sec = MAX_CHUNK_SECONDS;
     }
 
-    info!("convert_and_slice 完成: {} 个分片", chunk_index);
-
-    cleanup_temp(&temp_dir);
+    info!("[{}] convert_and_slice 完成: {} 个分片", file_name, chunk_index);
 
     Ok(chunk_index as usize)
 }
 
-fn cleanup_temp(path: &std::path::Path) {
-    if path.exists() {
-        let _ = std::fs::remove_dir_all(path);
+pub fn cleanup_temp(path: &std::path::Path) {
+    if !path.exists() { return; }
+    match std::fs::remove_dir_all(path) {
+        Ok(_) => { info!("临时目录已清理: {:?}", path); }
+        Err(e) => {
+            // Windows 文件句柄延迟释放，等待后重试一次
+            warn!("临时目录清理失败（重试中）: {:?}, {}", path, e);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            match std::fs::remove_dir_all(path) {
+                Ok(_) => { info!("临时目录已清理（重试成功）: {:?}", path); }
+                Err(e2) => { warn!("临时目录清理最终失败: {:?}, {}", path, e2); }
+            }
+        }
     }
 }
 
