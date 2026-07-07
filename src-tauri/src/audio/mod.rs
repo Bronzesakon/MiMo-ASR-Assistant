@@ -108,11 +108,12 @@ pub fn convert_and_slice(
     }
 
     // 动态切割
-    info!("[{}] 开始分片...", file_name);
+    let max_chunk = _slice_seconds.unwrap_or(MAX_CHUNK_SECONDS).min(150).max(10);
+    info!("[{}] 开始分片... (切片时长 {}s)", file_name, max_chunk);
     // 估算总分片数（用于前端进度条）
-    let estimated_total = ((total_duration / MAX_CHUNK_SECONDS as f64).ceil() as u32).max(1);
+    let estimated_total = ((total_duration / max_chunk as f64).ceil() as u32).max(1);
     let mut current_time = 0.0;
-    let mut chunk_sec = MAX_CHUNK_SECONDS;
+    let mut chunk_sec = max_chunk;
     let mut chunk_index = 0;
 
     while current_time < total_duration {
@@ -158,7 +159,7 @@ pub fn convert_and_slice(
 
         current_time += this_sec;
         chunk_index += 1;
-        chunk_sec = MAX_CHUNK_SECONDS;
+        chunk_sec = max_chunk;
     }
 
     info!("[{}] convert_and_slice 完成: {} 个分片", file_name, chunk_index);
@@ -180,6 +181,38 @@ pub fn cleanup_temp(path: &std::path::Path) {
             }
         }
     }
+}
+
+/// 统计目录中的切片文件数量
+pub fn count_slice_files(temp_dir: &std::path::Path) -> u32 {
+    collect_slice_files(temp_dir).len() as u32
+}
+
+/// 扫描目录中的切片文件，返回 (起始秒数, 路径) 按起始时间排序
+pub fn collect_slice_files(temp_dir: &std::path::Path) -> Vec<(f64, std::path::PathBuf)> {
+    let mut files: Vec<(f64, std::path::PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // 匹配 slice_{start}_{end}.wav
+            if let Some(params) = name.strip_prefix("slice_").and_then(|s| s.strip_suffix(".wav")) {
+                if let Some(start_str) = params.split('_').next() {
+                    if let Ok(start) = start_str.parse::<f64>() {
+                        files.push((start, entry.path()));
+                    }
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    files
+}
+
+/// 读取切片 WAV 文件并编码为 data URL
+pub fn encode_slice_to_data_url(slice_path: &std::path::Path) -> Result<String, AudioError> {
+    let audio_bytes = std::fs::read(slice_path)?;
+    let base64_str = base64_encode(&audio_bytes);
+    Ok(format!("data:audio/wav;base64,{}", base64_str))
 }
 
 fn base64_encoded_len(input_len: usize) -> usize {

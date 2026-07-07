@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use crate::info;
 
 /// 全局共享 HTTP 客户端（连接池复用，减少并发场景下 TCP 握手开销）
 fn http_client() -> &'static reqwest::Client {
@@ -351,6 +352,7 @@ enum FilterMode {
 
 /// 流式标签过滤器，处理 `<think>...</think>` 完全跳过，
 /// 其他标签如 `<chinese>` 只去除标签本身，保留内部文本。
+/// 同时处理 API 返回的无 `<` 前缀的 `think>` 文本块。
 struct TagFilter {
     mode: FilterMode,
     /// 标签缓冲区（处理跨 chunk 的不完整标签）
@@ -361,7 +363,18 @@ struct TagFilter {
     in_close_tag: bool,
     /// 等待的闭合标签名（如 "think"）
     skip_tag: String,
+    /// SkipContent 模式下已跳过的字符数（防止未闭合标签吞掉全部后续文本）
+    skip_chars: usize,
+    /// 逐字符匹配 `think>` 的状态机位置
+    think_match_pos: usize,
+    /// 正在收集的潜在 think> 文本（匹配失败时回吐到输出）
+    think_pending: String,
+    /// 是否在无标签 think 块中跳过
+    in_think_skip: bool,
 }
+
+const MAX_SKIP_CHARS: usize = 5000;
+const THINK_PATTERN: &[u8] = b"think>";
 
 impl TagFilter {
     fn new() -> Self {
@@ -371,6 +384,10 @@ impl TagFilter {
             in_tag: false,
             in_close_tag: false,
             skip_tag: String::new(),
+            skip_chars: 0,
+            think_match_pos: 0,
+            think_pending: String::new(),
+            in_think_skip: false,
         }
     }
 
@@ -379,6 +396,57 @@ impl TagFilter {
         let mut output = String::with_capacity(input.len());
 
         for ch in input.chars() {
+            // 先处理无标签 think> 匹配（仅在 Normal 模式且不在 HTML 标签收集中）
+            if self.mode == FilterMode::Normal && !self.in_tag {
+                if self.in_think_skip {
+                    // 在 think> 跳过模式中，检查是否遇到下一个 think>（结束标记）
+                    self.think_pending.push(ch);
+                    if self.think_pending.len() >= 6 {
+                        let tail = &self.think_pending[self.think_pending.len()-6..];
+                        if tail == "think>" {
+                            // 遇到下一个 think>，结束跳过
+                            self.in_think_skip = false;
+                            self.think_pending.clear();
+                            self.think_match_pos = 0;
+                            continue;
+                        }
+                    }
+                    // 跳过模式中，丢弃字符
+                    self.skip_chars += 1;
+                    if self.skip_chars > MAX_SKIP_CHARS {
+                        self.in_think_skip = false;
+                        self.think_pending.clear();
+                        self.think_match_pos = 0;
+                        self.skip_chars = 0;
+                        output.push(ch);
+                    }
+                    continue;
+                }
+
+                // 逐字符匹配 "think>"
+                let expected = THINK_PATTERN[self.think_match_pos] as char;
+                if ch == expected {
+                    self.think_match_pos += 1;
+                    self.think_pending.push(ch);
+                    if self.think_match_pos == THINK_PATTERN.len() {
+                        // 匹配成功，进入跳过模式
+                        self.in_think_skip = true;
+                        self.think_pending.clear();
+                        self.think_match_pos = 0;
+                        self.skip_chars = 0;
+                        continue;
+                    }
+                    // 还在匹配中，继续下一个字符
+                    continue;
+                } else if self.think_match_pos > 0 {
+                    // 匹配失败，回吐已收集的字符到输出
+                    self.think_match_pos = 0;
+                    output.push_str(&self.think_pending);
+                    self.think_pending.clear();
+                    // 当前字符继续走正常的 tag 处理逻辑
+                }
+            }
+
             match self.mode {
                 FilterMode::Normal => {
                     if ch == '<' {
@@ -399,6 +467,7 @@ impl TagFilter {
                                     self.mode = FilterMode::SkipContent;
                                     self.skip_tag = name;
                                     self.tag_buf.clear();
+                                    self.skip_chars = 0;
                                 } else {
                                     // 内容标签：丢弃标签本身，保留后续内容
                                     self.tag_buf.clear();
@@ -436,12 +505,22 @@ impl TagFilter {
                                     // 匹配的闭合标签，退出跳过模式
                                     self.mode = FilterMode::Normal;
                                     self.skip_tag.clear();
+                                    self.skip_chars = 0;
                                 }
                             }
                             self.tag_buf.clear();
                         }
+                    } else {
+                        // SkipContent 模式下，普通字符直接丢弃，但计数
+                        self.skip_chars += 1;
+                        if self.skip_chars > MAX_SKIP_CHARS {
+                            // 未闭合标签超限，强制退出跳过模式
+                            self.mode = FilterMode::Normal;
+                            self.skip_tag.clear();
+                            self.skip_chars = 0;
+                            output.push(ch);
+                        }
                     }
-                    // SkipContent 模式下，普通字符直接丢弃
                 }
             }
         }
@@ -536,6 +615,10 @@ async fn parse_sse_stream(
                         .and_then(|c| c.delta.as_ref())
                         .and_then(|d| d.content.as_ref())
                     {
+                        // [DEBUG_TEMP] 检测 think 标签相关 delta — 日后删除
+                        if text.contains("think") || text.contains("Think") {
+                            info!("[DEBUG_THINK] raw_delta={:?}", text);
+                        }
                         let filtered = tag_filter.process(text);
                         if !filtered.is_empty() {
                             let _ = emitter.emit(chunk_event, &filtered);

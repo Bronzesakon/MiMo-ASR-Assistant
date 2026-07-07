@@ -53,6 +53,7 @@ impl api::Emitter for TaggedEmitter {
 
 struct CancelHandle {
     cancelled: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
 }
 
 struct TaskRegistry {
@@ -66,6 +67,153 @@ async fn cancel_task(handle: AppHandle, file_id: String, file_name: String) {
         ch.cancelled.store(true, Ordering::Release);
         info!("[{}] 任务已取消", file_name);
     }
+}
+
+#[tauri::command]
+async fn pause_task(handle: AppHandle, file_id: String, file_name: String) {
+    let registry = handle.state::<TaskRegistry>();
+    let tasks = registry.tasks.lock().await;
+    if let Some(ch) = tasks.get(&file_id) {
+        ch.pause_flag.store(true, Ordering::Release);
+        info!("[{}] 暂停请求已发送", file_name);
+    }
+}
+
+#[tauri::command]
+fn cleanup_file_temp(temp_dir: String) {
+    audio::cleanup_temp(std::path::Path::new(&temp_dir));
+}
+
+/// 从暂停处继续转写：读取 temp 目录中的已有切片文件，从指定索引开始调用 API
+#[tauri::command]
+async fn resume_transcription(
+    handle: AppHandle,
+    file_id: String,
+    file_name: String,
+    temp_dir: String,
+    start_index: u32,
+    api_params: ApiParams,
+) -> Result<(), String> {
+    let temp_path = std::path::PathBuf::from(&temp_dir);
+    if !temp_path.exists() {
+        return Err("临时目录不存在，请重新转写".to_string());
+    }
+
+    let config: api::ApiConfig = api_params.into();
+    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
+    let plain_emitter = TauriEmitter { handle: handle.clone() };
+    let limiter = handle.state::<rate_limiter::AsrRateLimiter>();
+
+    // 注册取消和暂停句柄
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    {
+        let registry = handle.state::<TaskRegistry>();
+        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle {
+            cancelled: cancelled.clone(),
+            pause_flag: pause_flag.clone(),
+        });
+    }
+
+    // 扫描 temp 目录中的切片文件
+    let slice_files = audio::collect_slice_files(&temp_path);
+    let total = slice_files.len() as u32;
+    if total == 0 {
+        return Err("未找到切片文件，请重新转写".to_string());
+    }
+
+    info!("[{}] resume_transcription 开始: {} 个切片, 从分片 {} 继续", file_name, total, start_index);
+
+    let start_time = std::time::Instant::now();
+
+    // 从 start_index 开始遍历（start_index 是 1-based）
+    for (i, (_start_sec, slice_path)) in slice_files.iter().enumerate() {
+        let index = (i as u32) + 1; // 1-based
+        if index < start_index {
+            continue;
+        }
+
+        // 取消检查
+        if cancelled.load(Ordering::Acquire) {
+            let registry = handle.state::<TaskRegistry>();
+            registry.tasks.lock().await.remove(&file_id);
+            audio::cleanup_temp(&temp_path);
+            info!("[{}] resume_transcription 已取消", file_name);
+            return Ok(());
+        }
+
+        // 发射分片进度
+        let progress_json = serde_json::json!({
+            "file_id": file_id, "current": index, "total": total,
+        });
+        let _ = plain_emitter.emit("transcription-progress", &progress_json.to_string());
+
+        // 编码切片为 data URL
+        let data_url = audio::encode_slice_to_data_url(slice_path)
+            .map_err(|e| format!("切片编码失败: {}", e))?;
+
+        // 获取速率许可
+        let _permit = limiter.0.acquire_permit().await;
+
+        let slice_start = std::time::Instant::now();
+        let mut last_error = None;
+
+        for attempt in 1..=3u32 {
+            if attempt > 1 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            match api::stream_transcription(&data_url, &config, &tagged_emitter, &cancelled).await {
+                Ok(_) => { last_error = None; break; }
+                Err(e) => {
+                    warn!("[{}] 片段 {} 尝试 {} 失败: {}", file_name, index, attempt, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        if let Some(e) = last_error {
+            error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
+            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
+            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
+            let registry = handle.state::<TaskRegistry>();
+            registry.tasks.lock().await.remove(&file_id);
+            return Err(e.to_string());
+        }
+
+        // 发射状态更新
+        let slice_ms = slice_start.elapsed().as_millis();
+        let elapsed_s = start_time.elapsed().as_secs_f64();
+        let upload_speed = if slice_ms > 0 { (data_url.len() as f64 / slice_ms as f64) * 1000.0 } else { 0.0 };
+        let status_json = serde_json::json!({
+            "file_id": file_id, "slice": index, "total": total,
+            "elapsed": elapsed_s, "upload_speed": upload_speed,
+        });
+        let _ = plain_emitter.emit("status-update", &status_json.to_string());
+
+        // 暂停检查
+        if pause_flag.load(Ordering::Acquire) {
+            let actual_total = audio::count_slice_files(&temp_path);
+            let paused_json = serde_json::json!({
+                "file_id": file_id, "last_completed": index, "total": actual_total,
+                "temp_dir": temp_path.to_string_lossy(),
+            });
+            let _ = plain_emitter.emit("transcription-paused", &paused_json.to_string());
+            let registry = handle.state::<TaskRegistry>();
+            registry.tasks.lock().await.remove(&file_id);
+            info!("[{}] resume_transcription 已暂停 (分片 {}/{})", file_name, index, actual_total);
+            return Ok(());
+        }
+    }
+
+    // 全部完成
+    let registry = handle.state::<TaskRegistry>();
+    registry.tasks.lock().await.remove(&file_id);
+    audio::cleanup_temp(&temp_path);
+
+    let complete_json = serde_json::json!({ "file_id": file_id });
+    let _ = plain_emitter.emit("transcription-complete", &complete_json.to_string());
+    info!("[{}] resume_transcription 完成", file_name);
+    Ok(())
 }
 
 // ============================================================
@@ -138,6 +286,8 @@ pub struct AppConfig {
     pub asr_provider: String,
     #[serde(default = "default_polish_provider")]
     pub polish_provider: String,
+    #[serde(default = "default_slice_seconds")]
+    pub slice_seconds: u32,
 }
 
 fn default_true() -> bool { true }
@@ -145,6 +295,8 @@ fn default_true() -> bool { true }
 fn default_asr_provider() -> String { "mimo-api".to_string() }
 
 fn default_polish_provider() -> String { "deepseek".to_string() }
+
+fn default_slice_seconds() -> u32 { 10 }
 
 fn default_polish_prompt() -> String {
     "给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，优化每句话的口语化表达的语气词、重复字等，要求只做修饰，每句话都要输出，不可简略，不可概括，根据原文的内容，智能切分长段落".to_string()
@@ -164,6 +316,7 @@ impl Default for AppConfig {
             logging_enabled: true,
             asr_provider: "mimo-api".to_string(),
             polish_provider: "deepseek".to_string(),
+            slice_seconds: 10,
         }
     }
 }
@@ -289,11 +442,15 @@ async fn process_and_transcribe(
     let plain_emitter = TauriEmitter { handle: handle.clone() };
     let limiter = handle.state::<rate_limiter::AsrRateLimiter>();
 
-    // 注册取消句柄
+    // 注册取消和暂停句柄
     let cancelled = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
     {
         let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle { cancelled: cancelled.clone() });
+        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle {
+            cancelled: cancelled.clone(),
+            pause_flag: pause_flag.clone(),
+        });
     }
 
     if !path.exists() {
@@ -316,10 +473,13 @@ async fn process_and_transcribe(
     // 临时目录由本函数管理，确保取消时也能清理
     let temp_dir = audio::unique_temp_dir();
 
+    // 从配置读取切片时长
+    let slice_sec = load_config().slice_seconds;
+
     // 在阻塞线程中执行切片，每切完一片通过 channel 发送
     let slice_temp_dir = temp_dir.clone();
     let blocking_task = tokio::task::spawn_blocking(move || {
-        audio::convert_and_slice(&path, &slice_temp_dir, None, &|index, total, data_url| {
+        audio::convert_and_slice(&path, &slice_temp_dir, Some(slice_sec), &|index, total, data_url| {
             let _ = tx.blocking_send((index, total, data_url));
         })
     });
@@ -369,6 +529,27 @@ async fn process_and_transcribe(
             let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
             return Err(e.to_string());
         }
+
+        // 分片成功后检查暂停
+        if pause_flag.load(Ordering::Acquire) {
+            // 关闭 channel，blocking task 后续 blocking_send 失败，但会继续把剩余分片切完写入 temp
+            rx.take();
+            // 等待 blocking task 完成（确保 temp 目录中所有切片都写完）
+            let _ = blocking_task.await;
+            // 扫描 temp 目录获取实际切片总数
+            let actual_total = audio::count_slice_files(&temp_dir);
+            // 发射暂停事件
+            let paused_json = serde_json::json!({
+                "file_id": file_id, "last_completed": index, "total": actual_total,
+                "temp_dir": temp_dir.to_string_lossy(),
+            });
+            let _ = plain_emitter.emit("transcription-paused", &paused_json.to_string());
+            // 从 TaskRegistry 移除但不清理 temp
+            let registry = handle.state::<TaskRegistry>();
+            registry.tasks.lock().await.remove(&file_id);
+            info!("[{}] 已暂停 (分片 {}/{})", file_name, index, actual_total);
+            return Ok(());
+        }
     }
 
     // 等待 blocking task 完成
@@ -415,11 +596,15 @@ async fn start_chat(
     let plain_emitter = TauriEmitter { handle: handle.clone() };
     let limiter = handle.state::<rate_limiter::ChatRateLimiter>();
 
-    // 注册取消句柄
+    // 注册取消和暂停句柄
     let cancelled = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
     {
         let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle { cancelled: cancelled.clone() });
+        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle {
+            cancelled: cancelled.clone(),
+            pause_flag: pause_flag.clone(),
+        });
     }
 
     // 获取 Chat 速率许可（等待并发槽位 + RPM 余量）
@@ -584,6 +769,19 @@ fn clear_webview2_cache() {
     }
 }
 
+/// 启动时清理所有遗留的 mimo_ 临时目录（崩溃/异常退出残留）
+fn cleanup_legacy_temp() {
+    let temp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&temp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("mimo_") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
 // ============================================================
 // 应用入口
 // ============================================================
@@ -610,6 +808,9 @@ pub fn run() {
             process_and_transcribe,
             start_chat,
             cancel_task,
+            pause_task,
+            resume_transcription,
+            cleanup_file_temp,
             save_file,
             get_providers,
             detect_provider,
@@ -624,6 +825,7 @@ pub fn run() {
         ])
         .setup(|app| {
             clear_webview2_cache();
+            cleanup_legacy_temp();
 
             // 系统托盘图标
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;

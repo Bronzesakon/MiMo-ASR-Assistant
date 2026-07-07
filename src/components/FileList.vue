@@ -35,6 +35,8 @@ const statusMap: Record<string, { label: string; cls: string }> = {
   waiting: { label: '等待转写', cls: 's-waiting' },
   processing: { label: '准备中', cls: 's-active' },
   transcribing: { label: '转写中', cls: 's-active' },
+  pausing: { label: '正在暂停', cls: 's-pausing' },
+  paused: { label: '已暂停', cls: 's-paused' },
   polishing: { label: '规整中', cls: 's-active' },
   completed: { label: '已完成', cls: 's-done' },
   failed: { label: '失败', cls: 's-error' },
@@ -71,7 +73,14 @@ function fmtDur(s: number) {
 }
 
 function select(id: string) { closeAllDropdowns(); store.selectFile(id) }
-function remove(id: string, e: Event) { e.stopPropagation(); closeAllDropdowns(); store.requestCancelFile(id); store.removeFile(id) }
+function remove(id: string, e: Event) {
+  e.stopPropagation(); closeAllDropdowns()
+  const file = store.files.find(f => f.id === id)
+  if (file?.status === 'paused' && file.tempDir) {
+    invoke('cleanup_file_temp', { tempDir: file.tempDir }).catch(() => {})
+  }
+  store.requestCancelFile(id); store.removeFile(id)
+}
 
 // 拖拽导入
 const AUDIO_EXTS = ['.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg']
@@ -125,7 +134,12 @@ function confirmLanguage(fileId: string, language: string) {
 
 async function transcribeFile(fileId: string, language: string) {
   const file = store.files.find(f => f.id === fileId)
-  if (!file || file.status === 'transcribing' || file.status === 'processing') return
+  if (!file || file.status === 'transcribing' || file.status === 'processing' || file.status === 'pausing') return
+
+  // 如果是从暂停状态重新转写，先清理旧 temp 目录
+  if (file.tempDir) {
+    invoke('cleanup_file_temp', { tempDir: file.tempDir }).catch(() => {})
+  }
 
   console.log(`[转写] 开始: ${file.name}, 语言=${language}`)
 
@@ -134,6 +148,8 @@ async function transcribeFile(fileId: string, language: string) {
     transcription: '', polished: '',
     transcriptionWordCount: 0, polishedWordCount: 0,
     polishStage: 'idle', error: undefined,
+    tempDir: undefined, lastCompletedIndex: undefined, resumeTotal: undefined,
+    language,
   })
   store.isTranscribing = true
 
@@ -144,8 +160,6 @@ async function transcribeFile(fileId: string, language: string) {
   state.currentSlice = 0
 
   try {
-    store.updateFile(fileId, { status: 'transcribing' })
-
     await invoke('process_and_transcribe', {
       fileId,
       filePath: file.path,
@@ -297,15 +311,32 @@ function polishStageText(file: any): string {
         </div>
         <div v-if="f.error" class="file-error" :title="f.error">{{ f.error }}</div>
 
-        <div v-if="f.status === 'transcribing' || f.status === 'processing' || f.status === 'polishing'" class="file-progress">
+        <div v-if="['transcribing','polishing','pausing','paused'].includes(f.status)" class="file-progress">
           <div class="file-progress-bar" :style="{ width: f.progress + '%' }" />
         </div>
 
         <div class="file-actions">
-          <!-- 转写按钮 -->
-          <button
+          <!-- 暂停中：黄色提示，不可点击 -->
+          <button v-if="f.status === 'pausing'"
+            class="action-btn btn-pausing" disabled>
+            正在暂停
+          </button>
+          <!-- 已暂停：绿色继续按钮 -->
+          <button v-else-if="f.status === 'paused'"
+            class="action-btn btn-resume"
+            @click.stop="store.resumeTranscription(f.id)">
+            继续转写
+          </button>
+          <!-- 转写中：红色暂停按钮 -->
+          <button v-else-if="f.status === 'transcribing'"
+            class="action-btn btn-pause"
+            @click.stop="store.pauseTranscription(f.id)">
+            暂停转写
+          </button>
+          <!-- 默认：转写/重新转写 -->
+          <button v-else
             class="action-btn"
-            :class="{ disabled: f.status === 'transcribing' || f.status === 'processing' || f.status === 'polishing' }"
+            :class="{ disabled: f.status === 'processing' || f.status === 'polishing' }"
             @click.stop="showLanguageSelector(f.id)"
           >
             {{ (f.status === 'completed' || f.status === 'failed' || f.status === 'polishing') ? '重新转写' : '转写' }}
@@ -314,7 +345,7 @@ function polishStageText(file: any): string {
           <!-- AI规整按钮 -->
           <button
             class="action-btn"
-            :class="{ disabled: !f.transcription || f.status === 'transcribing' || f.status === 'processing' || f.status === 'polishing' || f.status === 'waiting' }"
+            :class="{ disabled: !f.transcription || ['transcribing','processing','pausing','polishing','waiting'].includes(f.status) }"
             @click.stop="polishFile(f.id)"
           >
             {{ f.polished ? '重新规整' : 'AI 规整' }}
@@ -324,7 +355,7 @@ function polishStageText(file: any): string {
           <div class="export-wrap" @click.stop="toggleExport($event, f.id)">
             <button
               class="action-btn action-export"
-              :class="{ disabled: f.status !== 'completed' || (!f.transcription && !f.polished) }"
+              :class="{ disabled: !['completed','paused'].includes(f.status) || (!f.transcription && !f.polished) }"
             >导出</button>
             <div class="export-dropdown">
               <button v-if="f.transcription" class="export-item" @click.stop="exportFile(f.id, 'original')">导出原文</button>
@@ -415,6 +446,8 @@ function polishStageText(file: any): string {
 .s-active { color: var(--accent); }
 .s-done { color: var(--success); }
 .s-error { color: var(--danger); }
+.s-pausing { color: var(--warning); }
+.s-paused { color: var(--warning); }
 .file-error {
   font-size: 10px;
   color: var(--danger);
@@ -448,6 +481,11 @@ function polishStageText(file: any): string {
 }
 .action-btn:hover { border-color: var(--border-strong); color: var(--text-primary); background: var(--bg-hover); }
 .action-btn:active { transform: scale(0.97); }
+.btn-pause { color: var(--danger); border-color: var(--danger); }
+.btn-pause:hover { background: rgba(212, 91, 91, 0.1); border-color: var(--danger); }
+.btn-pausing { color: var(--warning); border-color: var(--warning); opacity: 0.6; pointer-events: none; }
+.btn-resume { color: var(--success); border-color: var(--success); }
+.btn-resume:hover { background: rgba(92, 184, 92, 0.1); border-color: var(--success); }
 .action-btn.disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; color: var(--text-disabled); }
 .export-wrap { position: relative; }
 .export-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: var(--space-1); min-width: 120px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: var(--space-1); z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateY(4px) scale(0.97); pointer-events: none; transition: opacity 0.15s var(--ease-out), transform 0.15s var(--ease-out); }

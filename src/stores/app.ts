@@ -22,6 +22,7 @@ interface RustConfig {
   logging_enabled: boolean
   asr_provider: string
   polish_provider: string
+  slice_seconds: number
 }
 
 interface FileProcessState {
@@ -57,6 +58,7 @@ export const useAppStore = defineStore('app', () => {
     loggingEnabled: true,
     asrProvider: 'mimo-api',
     polishProvider: 'deepseek',
+    sliceSeconds: 10,
   })
 
   const fileStates = new Map<string, FileProcessState>()
@@ -109,9 +111,15 @@ export const useAppStore = defineStore('app', () => {
     setTimeout(() => { showToast.value = false }, 3000)
   }
 
+  const sliceOptionValues = [10, 30, 60, 150]
+
   async function loadConfig() {
     try {
       const config: RustConfig = await invoke('load_config')
+      const rawSlice = config.slice_seconds || 10
+      const snappedSlice = sliceOptionValues.reduce((prev, cur) =>
+        Math.abs(cur - rawSlice) < Math.abs(prev - rawSlice) ? cur : prev
+      )
       apiConfig.value = {
         provider: config.provider,
         baseUrl: config.base_url,
@@ -123,6 +131,7 @@ export const useAppStore = defineStore('app', () => {
         loggingEnabled: config.logging_enabled ?? true,
         asrProvider: config.asr_provider || 'mimo-api',
         polishProvider: config.polish_provider || 'deepseek',
+        sliceSeconds: snappedSlice,
       }
       theme.value = (config.theme as 'system' | 'light' | 'dark') || 'system'
       applyTheme()
@@ -146,6 +155,7 @@ export const useAppStore = defineStore('app', () => {
           logging_enabled: apiConfig.value.loggingEnabled,
           asr_provider: apiConfig.value.asrProvider,
           polish_provider: apiConfig.value.polishProvider,
+          slice_seconds: apiConfig.value.sliceSeconds || 10,
         }
       })
     } catch (e) {
@@ -264,12 +274,13 @@ export const useAppStore = defineStore('app', () => {
         if (!isNaN(current) && current > state.currentSlice) {
           state.currentSlice = current
         }
-        // 进度 = 正在处理的分片序号 / 总分片数
+        // 进度 = 已完成分片 / 总分片数（纯 API 进度，不含切片）
         if (file && state.totalSlices > 0) {
-          const sliceProgress = state.currentSlice / state.totalSlices
-          const chunks = state.transcriptionChunks
-          const textProgress = chunks > 0 ? 1 - 1 / (1 + chunks * 0.1) : 0
-          file.progress = Math.min(97, Math.round(sliceProgress * 70 + textProgress * 30))
+          file.progress = Math.min(97, Math.round(state.currentSlice / state.totalSlices * 97))
+          // 第一个 progress 事件到达 → 从"准备中"切换到"转写中"
+          if (file.status === 'processing') {
+            file.status = 'transcribing'
+          }
         }
       } catch (e) {
         console.error('[事件] transcription-progress 解析失败:', e)
@@ -294,6 +305,29 @@ export const useAppStore = defineStore('app', () => {
         if (fileId === selectedFileId.value) showToastMessage(`${file?.name || '文件'} 转写完成`, 'success')
       } catch (e) {
         console.error('[事件] transcription-complete 解析失败:', e)
+      }
+    }).then(fn => unlistenFns.push(fn))
+
+    // 转写暂停
+    listen<string>('transcription-paused', (event) => {
+      try {
+        const data = JSON.parse(event.payload)
+        const fileId = data.file_id
+        const file = files.value.find(f => f.id === fileId)
+        if (file) {
+          file.status = 'paused'
+          file.tempDir = data.temp_dir
+          file.lastCompletedIndex = data.last_completed
+          file.resumeTotal = data.total
+          file.transcriptionWordCount = countWords(file.transcription)
+        }
+        // 不删除 fileStates：保留 transcriptionChunks 等状态供 resume 时进度计算
+        isTranscribing.value = files.value.some(f =>
+          f.status === 'transcribing' || f.status === 'processing' || f.status === 'pausing'
+        )
+        if (fileId === selectedFileId.value) showToastMessage(`${file?.name || '文件'} 已暂停转写`, 'info')
+      } catch (e) {
+        console.error('[事件] transcription-paused 解析失败:', e)
       }
     }).then(fn => unlistenFns.push(fn))
 
@@ -387,6 +421,53 @@ export const useAppStore = defineStore('app', () => {
     invoke('cancel_task', { fileId, fileName: file?.name || fileId }).catch(() => {})
   }
 
+  function pauseTranscription(fileId: string) {
+    const file = files.value.find(f => f.id === fileId)
+    if (!file) return
+    updateFile(fileId, { status: 'pausing' })
+    showToastMessage(`${file.name} 正在暂停转写`, 'info')
+    invoke('pause_task', { fileId, fileName: file.name }).catch(() => {})
+  }
+
+  async function resumeTranscription(fileId: string) {
+    const file = files.value.find(f => f.id === fileId)
+    if (!file || !file.tempDir || !file.lastCompletedIndex) return
+
+    const startIndex = (file.lastCompletedIndex ?? 0) + 1
+    const resumeTotal = file.resumeTotal ?? 1
+    updateFile(fileId, { status: 'processing', progress: 0 })
+    isTranscribing.value = true
+
+    const state = ensureFileState(fileId)
+    state.transcribeStartTime = Date.now()
+    state.outputCharCount = 0
+    state.totalSlices = resumeTotal
+    state.currentSlice = startIndex - 1
+    // transcriptionChunks 不重置：保留已累积的文本进度，防止进度回退
+
+    try {
+      await invoke('resume_transcription', {
+        fileId,
+        fileName: file.name,
+        tempDir: file.tempDir,
+        startIndex: file.lastCompletedIndex + 1,
+        apiParams: {
+          base_url: asrBaseUrl.value,
+          api_key: asrKey.value,
+          model: apiConfig.value.transcriptionModel,
+          language: file.language || 'auto',
+        },
+      })
+    } catch (e) {
+      console.error(`[转写] 继续转写失败: ${file.name}`, e)
+      const errMsg = String(e).replace(/^Error invoking plugin /, '').slice(0, 200)
+      updateFile(fileId, { status: 'failed', error: errMsg })
+      showToastMessage(`${file.name} 继续转写失败`, 'error')
+    }
+
+    isTranscribing.value = files.value.some(f => f.status === 'transcribing' || f.status === 'processing')
+  }
+
   return {
     files, selectedFileId,
     isSettingsOpen, isTranscribing, apiConfig, statusInfo,
@@ -397,5 +478,6 @@ export const useAppStore = defineStore('app', () => {
     addFile, removeFile, updateFile, selectFile,
     resetStatus, ensureFileState, fileStates,
     requestCancelFile, speedTick,
+    pauseTranscription, resumeTranscription,
   }
 })

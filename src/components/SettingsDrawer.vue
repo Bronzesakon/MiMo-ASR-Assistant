@@ -88,6 +88,22 @@ function onToggleLogging(v: boolean) {
 
 function close() { store.isSettingsOpen = false; store.saveConfig() }
 
+const sliceOptions = [
+  { value: '10', label: '10 秒（默认）' },
+  { value: '30', label: '30 秒' },
+  { value: '60', label: '60 秒' },
+  { value: '150', label: '150 秒' },
+]
+
+const sliceDisabled = computed(() =>
+  store.files.some(f => ['transcribing', 'processing', 'pausing', 'paused'].includes(f.status))
+)
+
+function onSliceSecondsChange(val: string) {
+  store.apiConfig.sliceSeconds = Number(val)
+  store.saveConfig()
+}
+
 function onAsrProviderChange(v: string) {
   store.apiConfig.asrProvider = v
   store.saveConfig()
@@ -186,6 +202,19 @@ function openLogDir() {
             </Transition>
           </div>
 
+          <div class="field">
+            <label class="label">切片时长</label>
+            <CustomSelect
+              :model-value="String(store.apiConfig.sliceSeconds)"
+              :options="sliceOptions"
+              :disabled="sliceDisabled"
+              @update:model-value="onSliceSecondsChange"
+            />
+            <div class="hint-box">
+              <p class="hint-text">单次发送给 API 的音频时长。越短响应越快，越长分片越少。有任务进行或暂停时不可修改。</p>
+            </div>
+          </div>
+
           <!-- 规整 -->
           <div class="section-divider"><span>规整</span></div>
 
@@ -249,7 +278,7 @@ function openLogDir() {
               </button>
             </div>
             <div class="hint-box">
-              <p class="hint-text">关闭后不再输出运行日志，错误日志始终保留。重启后生效。</p>
+              <p class="hint-text">关闭后不再输出运行日志，错误日志始终保留。</p>
             </div>
           </div>
 

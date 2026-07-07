@@ -58,14 +58,14 @@ impl RateLimiter {
     }
 }
 
-/// ASR 速率控制器（100 RPM API 上限，留 10% 余量 → 90 RPM，3 并发）
+/// ASR 速率控制器（100 RPM API 上限，留 10% 余量 → 90 RPM，8 并发）
 pub struct AsrRateLimiter(pub RateLimiter);
 
 /// Chat 速率控制器（Pro 系列 100 RPM，留 10% 余量 → 90 RPM，3 并发）
 pub struct ChatRateLimiter(pub RateLimiter);
 
 pub fn create_asr_limiter() -> AsrRateLimiter {
-    AsrRateLimiter(RateLimiter::new(3, 90))
+    AsrRateLimiter(RateLimiter::new(8, 90))
 }
 
 pub fn create_chat_limiter() -> ChatRateLimiter {

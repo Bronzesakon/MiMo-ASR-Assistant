@@ -5,6 +5,7 @@ const props = defineProps<{
   modelValue: string
   options: { value: string; label: string }[]
   placeholder?: string
+  disabled?: boolean
 }>()
 
 const emit = defineEmits<{ (e: 'update:modelValue', value: string): void }>()
@@ -13,6 +14,7 @@ const open = ref(false)
 const root = ref<HTMLElement>()
 
 function select(value: string) {
+  if (props.disabled) return
   emit('update:modelValue', value)
   open.value = false
 }
@@ -27,6 +29,11 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') open.value = false
 }
 
+function toggleOpen() {
+  if (props.disabled) return
+  open.value = !open.value
+}
+
 onMounted(() => {
   document.addEventListener('mousedown', onClickOutside)
   document.addEventListener('keydown', onKeydown)
@@ -38,8 +45,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="root" class="cs-select" :class="{ open }">
-    <button class="cs-trigger" @click="open = !open" type="button">
+  <div ref="root" class="cs-select" :class="{ open, disabled }">
+    <button class="cs-trigger" @click="toggleOpen" type="button" :disabled="disabled">
       <span class="cs-value">{{ options.find(o => o.value === modelValue)?.label || placeholder || '' }}</span>
       <svg class="cs-icon" width="12" height="12" viewBox="0 0 12 12" fill="none">
         <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -93,6 +100,12 @@ onBeforeUnmount(() => {
 .cs-select.open .cs-trigger {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(110, 158, 255, 0.15);
+}
+
+.cs-select.disabled .cs-trigger {
+  opacity: 0.3;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 .cs-value {

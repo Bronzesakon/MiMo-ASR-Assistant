@@ -4,7 +4,7 @@ export interface FileInfo {
   path: string
   duration: number
   size: number
-  status: 'waiting' | 'processing' | 'transcribing' | 'polishing' | 'completed' | 'failed'
+  status: 'waiting' | 'processing' | 'transcribing' | 'pausing' | 'paused' | 'polishing' | 'completed' | 'failed'
   progress: number
   transcription: string
   polished: string
@@ -12,6 +12,10 @@ export interface FileInfo {
   polishedWordCount: number
   polishStage: 'idle' | 'sending' | 'receiving' | 'failed'
   error?: string
+  tempDir?: string
+  lastCompletedIndex?: number
+  resumeTotal?: number
+  language?: string
 }
 
 export interface ApiConfig {
@@ -25,6 +29,7 @@ export interface ApiConfig {
   loggingEnabled: boolean
   asrProvider: string
   polishProvider: string
+  sliceSeconds: number
 }
 
 export interface ProviderInfo {
