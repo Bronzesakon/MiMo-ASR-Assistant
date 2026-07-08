@@ -31,7 +31,7 @@ onMounted(async () => {
       <Workspace />
     </div>
     <StatusBar />
-    <SettingsDrawer v-show="store.isSettingsOpen" />
+    <SettingsDrawer />
     <Toast />
   </div>
 </template>
@@ -57,9 +57,11 @@ onMounted(async () => {
   --space-4: 16px;
   --space-5: 20px;
   --space-6: 24px;
+  --space-7: 28px;
   --space-8: 32px;
 
   /* Radius scale */
+  --radius-xs: 4px;
   --radius-sm: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;

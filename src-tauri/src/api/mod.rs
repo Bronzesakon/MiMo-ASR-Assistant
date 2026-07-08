@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use crate::info;
 
 /// 全局共享 HTTP 客户端（连接池复用，减少并发场景下 TCP 握手开销）
-fn http_client() -> &'static reqwest::Client {
+pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()

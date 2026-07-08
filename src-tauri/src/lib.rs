@@ -269,6 +269,15 @@ impl From<provider::ProviderInfo> for ProviderInfo {
 use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CustomProvider {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub provider: String,
     pub base_url: String,
@@ -288,6 +297,8 @@ pub struct AppConfig {
     pub polish_provider: String,
     #[serde(default = "default_slice_seconds")]
     pub slice_seconds: u32,
+    #[serde(default)]
+    pub custom_providers: Vec<CustomProvider>,
 }
 
 fn default_true() -> bool { true }
@@ -317,6 +328,7 @@ impl Default for AppConfig {
             asr_provider: "mimo-api".to_string(),
             polish_provider: "deepseek".to_string(),
             slice_seconds: 10,
+            custom_providers: Vec::new(),
         }
     }
 }
@@ -368,6 +380,18 @@ fn load_config() -> AppConfig {
                         }
                     }
                 }
+                // 解密 custom_providers 的 api_key
+                for cp in config.custom_providers.iter_mut() {
+                    if cp.api_key.starts_with("ENC:") {
+                        match dpapi::decrypt_string(&cp.api_key[4..]) {
+                            Ok(decrypted) => cp.api_key = decrypted,
+                            Err(e) => {
+                                error!("[{}] 自定义服务商 Key 解密失败: {}", cp.name, e);
+                                cp.api_key.clear();
+                            }
+                        }
+                    }
+                }
                 config
             }
             Err(_) => AppConfig::default(),
@@ -400,6 +424,13 @@ fn save_config(config: AppConfig) -> Result<(), String> {
         if !value.is_empty() {
             let encrypted = dpapi::encrypt_string(value).map_err(|e| e.to_string())?;
             *value = format!("ENC:{}", encrypted);
+        }
+    }
+    // 加密 custom_providers 的 api_key
+    for cp in save.custom_providers.iter_mut() {
+        if !cp.api_key.is_empty() {
+            let encrypted = dpapi::encrypt_string(&cp.api_key).map_err(|e| e.to_string())?;
+            cp.api_key = format!("ENC:{}", encrypted);
         }
     }
     let json = serde_json::to_string_pretty(&save).map_err(|e| e.to_string())?;
@@ -718,6 +749,79 @@ fn open_log_dir() -> Result<(), String> {
     Ok(())
 }
 
+/// 从自定义 OpenAI 兼容服务商获取可用模型列表
+#[tauri::command]
+async fn fetch_custom_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+    if api_key.is_empty() {
+        return Err("API Key 不能为空".to_string());
+    }
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("Base URL 不能为空".to_string());
+    }
+
+    // 标准化双斜杠
+    let normalized = trimmed.replace("//", "/").replacen(":/", "://", 1);
+
+    // 构造候选 URL（按优先级排列）
+    let mut candidates: Vec<String> = Vec::new();
+    let lower = normalized.to_lowercase();
+
+    if lower.ends_with("/models") {
+        // 用户已提供完整 models 端点
+        candidates.push(normalized.clone());
+    } else if lower.ends_with("/v1") {
+        candidates.push(format!("{}/models", normalized));
+    } else {
+        candidates.push(format!("{}/v1/models", normalized));
+        candidates.push(format!("{}/models", normalized));
+    }
+
+    let client = api::http_client();
+    let mut last_err: Option<String> = None;
+
+    for url in &candidates {
+        let response = match client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err(format!("请求失败: {}", e)),
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("解析响应失败: {}", e))?;
+
+            let mut models: Vec<String> = Vec::new();
+            if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                for entry in data {
+                    if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                        models.push(id.to_string());
+                    }
+                }
+            }
+            models.sort();
+            return Ok(models);
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            last_err = Some(format!("HTTP {}", status));
+            continue;
+        }
+
+        return Err(format!("HTTP {}: {}", status, response.text().await.unwrap_or_default()));
+    }
+
+    Err(format!("获取模型列表失败: {}", last_err.unwrap_or_else(|| "无候选端点".to_string())))
+}
+
 /// 获取可用服务商列表
 #[tauri::command]
 fn get_providers() -> Vec<ProviderInfo> {
@@ -822,6 +926,7 @@ pub fn run() {
             hide_main_window,
             show_main_window,
             open_log_dir,
+            fetch_custom_models,
         ])
         .setup(|app| {
             clear_webview2_cache();

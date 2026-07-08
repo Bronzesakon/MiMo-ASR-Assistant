@@ -3,11 +3,16 @@ import { useAppStore } from '../stores/app'
 import { invoke } from '@tauri-apps/api/core'
 import { ref, computed, reactive } from 'vue'
 import CustomSelect from './CustomSelect.vue'
+import CustomProviderModal from './CustomProviderModal.vue'
+import type { CustomProvider } from '../types'
 
 const store = useAppStore()
 const showAsrKey = ref(false)
 const showPolishKey = ref(false)
 const showHelp = reactive<Record<string, boolean>>({ asrKey: false, polishKey: false })
+
+const customModalVisible = ref(false)
+const customModalEdit = ref<CustomProvider | null>(null)
 
 function toggleHelp(id: string) {
   showHelp[id] = !showHelp[id]
@@ -28,6 +33,10 @@ const polishProviders = [
 
 const currentAsrProv = computed(() => asrProviders.find(p => p.id === store.apiConfig.asrProvider) || asrProviders[0])
 const currentPolishProv = computed(() => polishProviders.find(p => p.id === store.apiConfig.polishProvider) || polishProviders[0])
+const isCustomPolishProvider = computed(() => store.isCustomProvider(store.apiConfig.polishProvider))
+const currentCustomPolishProv = computed(() => {
+  return store.getCustomProvider(store.apiConfig.polishProvider)
+})
 
 function getAsrHelpLinks(): { text: string; links: HelpLink[] } {
   const id = store.apiConfig.asrProvider
@@ -111,9 +120,16 @@ function onAsrProviderChange(v: string) {
 
 function onPolishProviderChange(v: string) {
   store.apiConfig.polishProvider = v
-  const prov = polishProviders.find(p => p.id === v)
-  if (prov && !prov.chat.includes(store.apiConfig.polishModel)) {
-    store.apiConfig.polishModel = prov.chat[0]
+  if (!v.startsWith('custom_')) {
+    const prov = polishProviders.find(p => p.id === v)
+    if (prov && !prov.chat.includes(store.apiConfig.polishModel)) {
+      store.apiConfig.polishModel = prov.chat[0]
+    }
+  } else {
+    const models = store.customPolishModels
+    if (models.length > 0) {
+      store.apiConfig.polishModel = models[0]
+    }
   }
   store.saveConfig()
 }
@@ -121,6 +137,46 @@ function onPolishProviderChange(v: string) {
 function onPolishModelChange(v: string) {
   store.apiConfig.polishModel = v
   store.saveConfig()
+}
+
+function onCustomDelete(customProviderId: string) {
+  store.removeCustomProvider(customProviderId)
+}
+
+function onCustomAdd() {
+  customModalEdit.value = null
+  customModalVisible.value = true
+}
+
+function onCustomEdit(customProviderId: string) {
+  const cp = store.apiConfig.customProviders.find(p => p.id === customProviderId)
+  if (cp) {
+    customModalEdit.value = cp
+    customModalVisible.value = true
+  }
+}
+
+function onCustomModalSave(provider: CustomProvider) {
+  if (customModalEdit.value) {
+    store.updateCustomProvider(provider.id, provider)
+    // 如果当前选中的模型不在新列表中，默认选中第一个
+    if (store.apiConfig.polishProvider === `custom_${provider.id}` &&
+        !provider.models.includes(store.apiConfig.polishModel)) {
+      if (provider.models.length > 0) {
+        store.apiConfig.polishModel = provider.models[0]
+      }
+    }
+  } else {
+    store.addCustomProvider(provider)
+  }
+  customModalVisible.value = false
+  customModalEdit.value = null
+  store.saveConfig()
+}
+
+function onCustomModalClose() {
+  customModalVisible.value = false
+  customModalEdit.value = null
 }
 
 function onAsrKeyChange() {
@@ -142,7 +198,7 @@ function openLogDir() {
 
 <template>
   <Transition name="modal">
-    <div class="overlay" @click.self="close" @keydown="onOverlayKeydown" tabindex="-1">
+    <div v-if="store.isSettingsOpen" class="overlay" @click.self="close" @keydown="onOverlayKeydown" tabindex="-1">
       <div class="panel">
         <div class="panel-header">
           <span class="panel-title">设置</span>
@@ -222,14 +278,20 @@ function openLogDir() {
             <label class="label">规整服务商</label>
             <CustomSelect
               :model-value="store.apiConfig.polishProvider"
-              :options="polishProviders.map(p => ({ value: p.id, label: p.name }))"
+              :options="store.polishProviderOptions.map(o => ({ value: o.type === 'custom' ? store.getCustomOptionValue(o.customProviderId!) : o.providerId, label: o.label, group: o.type, customProviderId: o.customProviderId }))"
+              :show-add-custom="true"
               @update:model-value="onPolishProviderChange"
+              @add-custom="onCustomAdd"
+              @edit-custom="onCustomEdit"
+              @delete="onCustomDelete"
             />
           </div>
 
-          <div class="field">
-            <label class="label">{{ currentPolishProv.keyLabel }}</label>
-            <div class="key-row">
+          <!-- 内置服务商专属：API Key + 模型下拉 -->
+          <template v-if="!isCustomPolishProvider">
+            <div class="field">
+              <label class="label">{{ currentPolishProv.keyLabel }}</label>
+              <div class="key-row">
               <input
                 :value="store.apiConfig.providerKeys[store.apiConfig.polishProvider] || ''"
                 @input="(e: Event) => { store.apiConfig.providerKeys[store.apiConfig.polishProvider] = (e.target as HTMLInputElement).value }"
@@ -256,6 +318,26 @@ function openLogDir() {
               @update:model-value="onPolishModelChange"
             />
           </div>
+          </template>
+
+          <!-- 自定义服务商专属：显示模型下拉 -->
+          <template v-else-if="currentCustomPolishProv">
+            <div class="field">
+              <label class="label">规整模型</label>
+              <CustomSelect
+                :model-value="store.apiConfig.polishModel"
+                :options="store.customPolishModels.map(m => ({ value: m, label: m }))"
+                @update:model-value="onPolishModelChange"
+              />
+            </div>
+            <div class="field">
+              <label class="label">API Key</label>
+              <input class="input input-readonly" value="***" readonly />
+              <div class="hint-box">
+                <p class="hint-text">自定义服务商的 API Key 已保存。点击上方下拉列表中的服务商名称可编辑。</p>
+              </div>
+            </div>
+          </template>
 
           <div class="field">
             <label class="label">AI 规整提示词</label>
@@ -290,6 +372,12 @@ function openLogDir() {
       </div>
     </div>
   </Transition>
+  <CustomProviderModal
+    :visible="customModalVisible"
+    :edit-provider="customModalEdit"
+    @save="onCustomModalSave"
+    @close="onCustomModalClose"
+  />
 </template>
 
 <style scoped>

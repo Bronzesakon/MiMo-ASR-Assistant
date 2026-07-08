@@ -30,6 +30,7 @@ export interface ApiConfig {
   asrProvider: string
   polishProvider: string
   sliceSeconds: number
+  customProviders: CustomProvider[]
 }
 
 export interface ProviderInfo {
@@ -37,4 +38,20 @@ export interface ProviderInfo {
   name: string
   baseUrl: string
   keyPrefix: string
+}
+
+export interface CustomProvider {
+  id: string
+  name: string
+  baseUrl: string
+  apiKey: string
+  models: string[]
+}
+
+export interface CustomModelOption {
+  type: 'builtin' | 'custom'
+  providerId: string
+  modelId: string
+  label: string
+  customProviderId?: string
 }

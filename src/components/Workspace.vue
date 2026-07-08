@@ -268,8 +268,8 @@ async function copyText(type: 'original' | 'polished') {
   transition: all var(--duration-fast) var(--ease-out);
 }
 
-.ws-btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
-.ws-btn.copied { color: var(--success); border-color: var(--success); }
+.ws-btn:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); }
+.ws-btn.copied { color: var(--success); border-color: var(--success); background: var(--success-muted); }
 
 .ws-body {
   flex: 1;

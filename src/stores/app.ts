@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import type { FileInfo, ApiConfig } from '../types'
+import type { FileInfo, ApiConfig, CustomProvider, CustomModelOption } from '../types'
 
 const PROVIDER_URLS: Record<string, string> = {
   'mimo-api': 'https://api.xiaomimimo.com/v1',
@@ -23,6 +23,7 @@ interface RustConfig {
   asr_provider: string
   polish_provider: string
   slice_seconds: number
+  custom_providers: Array<{ id: string; name: string; base_url: string; api_key: string; models: string[] }>
 }
 
 interface FileProcessState {
@@ -59,6 +60,7 @@ export const useAppStore = defineStore('app', () => {
     asrProvider: 'mimo-api',
     polishProvider: 'deepseek',
     sliceSeconds: 10,
+    customProviders: [],
   })
 
   const fileStates = new Map<string, FileProcessState>()
@@ -100,9 +102,35 @@ export const useAppStore = defineStore('app', () => {
   )
 
   const asrKey = computed(() => apiConfig.value.providerKeys[apiConfig.value.asrProvider] || '')
-  const polishKey = computed(() => apiConfig.value.providerKeys[apiConfig.value.polishProvider] || '')
   const asrBaseUrl = computed(() => PROVIDER_URLS[apiConfig.value.asrProvider] || PROVIDER_URLS['mimo-api'])
-  const polishBaseUrl = computed(() => PROVIDER_URLS[apiConfig.value.polishProvider] || PROVIDER_URLS['deepseek'])
+
+  // Custom provider 辅助 - polishProvider 格式：custom_{providerId}
+  function isCustomProvider(id: string): boolean {
+    return id.startsWith('custom_')
+  }
+
+  function getCustomProvider(id: string): CustomProvider | null {
+    if (!isCustomProvider(id)) return null
+    const providerId = id.slice('custom_'.length)
+    return apiConfig.value.customProviders.find(p => p.id === providerId) || null
+  }
+
+  const polishKey = computed(() => {
+    const cp = getCustomProvider(apiConfig.value.polishProvider)
+    if (cp) return cp.apiKey
+    return apiConfig.value.providerKeys[apiConfig.value.polishProvider] || ''
+  })
+  const polishBaseUrl = computed(() => {
+    const cp = getCustomProvider(apiConfig.value.polishProvider)
+    if (cp) return cp.baseUrl
+    return PROVIDER_URLS[apiConfig.value.polishProvider] || PROVIDER_URLS['deepseek']
+  })
+  const polishModel = computed(() => {
+    if (isCustomProvider(apiConfig.value.polishProvider)) {
+      return apiConfig.value.polishModel
+    }
+    return apiConfig.value.polishModel
+  })
 
   function showToastMessage(message: string, type: 'info' | 'error' | 'success' = 'info') {
     toastMessage.value = message
@@ -132,6 +160,9 @@ export const useAppStore = defineStore('app', () => {
         asrProvider: config.asr_provider || 'mimo-api',
         polishProvider: config.polish_provider || 'deepseek',
         sliceSeconds: snappedSlice,
+        customProviders: (config.custom_providers || []).map(cp => ({
+          id: cp.id, name: cp.name, baseUrl: cp.base_url, apiKey: cp.api_key, models: cp.models,
+        })),
       }
       theme.value = (config.theme as 'system' | 'light' | 'dark') || 'system'
       applyTheme()
@@ -156,6 +187,9 @@ export const useAppStore = defineStore('app', () => {
           asr_provider: apiConfig.value.asrProvider,
           polish_provider: apiConfig.value.polishProvider,
           slice_seconds: apiConfig.value.sliceSeconds || 10,
+          custom_providers: apiConfig.value.customProviders.map(cp => ({
+            id: cp.id, name: cp.name, base_url: cp.baseUrl, api_key: cp.apiKey, models: cp.models,
+          })),
         }
       })
     } catch (e) {
@@ -468,16 +502,84 @@ export const useAppStore = defineStore('app', () => {
     isTranscribing.value = files.value.some(f => f.status === 'transcribing' || f.status === 'processing')
   }
 
+  // ============================================================
+  // 自定义服务商 CRUD
+  // ============================================================
+
+  const BUILTIN_POLISH_PROVIDERS = ['deepseek', 'mimo-api', 'mimo-token-plan']
+
+  function addCustomProvider(provider: CustomProvider) {
+    apiConfig.value.customProviders.push(provider)
+    saveConfig()
+  }
+
+  function updateCustomProvider(id: string, updates: Partial<CustomProvider>) {
+    const cp = apiConfig.value.customProviders.find(p => p.id === id)
+    if (cp) Object.assign(cp, updates)
+    saveConfig()
+  }
+
+  function removeCustomProvider(id: string) {
+    apiConfig.value.customProviders = apiConfig.value.customProviders.filter(p => p.id !== id)
+    // 如果当前选中的 polishProvider 属于被删除的自定义服务商，重置为 deepseek
+    if (isCustomProvider(apiConfig.value.polishProvider)) {
+      const providerId = apiConfig.value.polishProvider.slice('custom_'.length)
+      if (providerId === id) {
+        apiConfig.value.polishProvider = 'deepseek'
+      }
+    }
+    saveConfig()
+  }
+
+  const polishProviderOptions = computed(() => {
+    const options: CustomModelOption[] = []
+    // 内置服务商
+    for (const id of BUILTIN_POLISH_PROVIDERS) {
+      const names: Record<string, string> = {
+        'deepseek': 'DeepSeek',
+        'mimo-api': 'MiMo API',
+        'mimo-token-plan': 'MiMo Token Plan',
+      }
+      options.push({ type: 'builtin', providerId: id, modelId: id, label: names[id] || id })
+    }
+    // 自定义服务商 - 只显示名称，不显示模型
+    for (const cp of apiConfig.value.customProviders) {
+      options.push({
+        type: 'custom',
+        providerId: cp.id,
+        modelId: cp.id,
+        label: cp.name,
+        customProviderId: cp.id,
+      })
+    }
+    return options
+  })
+
+  // 当前选中的自定义服务商的模型列表
+  const customPolishModels = computed(() => {
+    const cp = getCustomProvider(apiConfig.value.polishProvider)
+    if (!cp) return []
+    return cp.models
+  })
+
+  /** 获取自定义服务商选项的 value 编码 */
+  function getCustomOptionValue(customProviderId: string): string {
+    return `custom_${customProviderId}`
+  }
+
   return {
     files, selectedFileId,
     isSettingsOpen, isTranscribing, apiConfig, statusInfo,
     selectedFile, completedCount, hasActiveFiles,
-    asrKey, polishKey, asrBaseUrl, polishBaseUrl,
+    asrKey, polishKey, asrBaseUrl, polishBaseUrl, polishModel,
     theme, toastMessage, toastType, showToast,
     showToastMessage, loadConfig, saveConfig, setTheme, applyTheme,
     addFile, removeFile, updateFile, selectFile,
     resetStatus, ensureFileState, fileStates,
     requestCancelFile, speedTick,
     pauseTranscription, resumeTranscription,
+    addCustomProvider, updateCustomProvider, removeCustomProvider,
+    polishProviderOptions, customPolishModels,
+    getCustomOptionValue, isCustomProvider, getCustomProvider,
   }
 })

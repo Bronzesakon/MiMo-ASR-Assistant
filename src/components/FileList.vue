@@ -212,7 +212,7 @@ async function polishFile(fileId: string) {
       apiParams: {
         base_url: store.polishBaseUrl,
         api_key: store.polishKey,
-        model: store.apiConfig.polishModel,
+        model: store.polishModel,
         language: 'auto',
       },
       responseFormat: null,
@@ -323,7 +323,7 @@ function polishStageText(file: any): string {
           </button>
           <!-- 已暂停：绿色继续按钮 -->
           <button v-else-if="f.status === 'paused'"
-            class="action-btn btn-resume"
+            class="action-btn btn-primary"
             @click.stop="store.resumeTranscription(f.id)">
             继续转写
           </button>
@@ -335,7 +335,7 @@ function polishStageText(file: any): string {
           </button>
           <!-- 默认：转写/重新转写 -->
           <button v-else
-            class="action-btn"
+            class="action-btn btn-primary"
             :class="{ disabled: f.status === 'processing' || f.status === 'polishing' }"
             @click.stop="showLanguageSelector(f.id)"
           >
@@ -401,7 +401,7 @@ function polishStageText(file: any): string {
 .sidebar-search { padding: var(--space-3); border-bottom: 1px solid var(--border-default); position: relative; }
 .search-icon { position: absolute; left: calc(var(--space-3) + 10px); top: 50%; transform: translateY(-50%); color: var(--text-disabled); pointer-events: none; }
 .search-input { width: 100%; height: 32px; padding: 0 var(--space-2) 0 30px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-primary); font-size: 12px; font-family: var(--font-sans); outline: none; transition: all 0.15s var(--ease-out); }
-.search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(110, 158, 255, 0.15); background: var(--bg-base); }
+.search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(110, 158, 255, 0.1); background: var(--bg-base); }
 .search-input::placeholder { color: var(--text-disabled); }
 .file-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--space-2); display: flex; flex-direction: column; gap: var(--space-1); position: relative; }
 
@@ -424,14 +424,17 @@ function polishStageText(file: any): string {
   border-color: rgba(110, 158, 255, 0.35);
   box-shadow: 0 0 0 1px rgba(110, 158, 255, 0.08), 0 2px 8px rgba(110, 158, 255, 0.06);
 }
-/* Gradient overlay on selected item */
+/* 左侧蓝色高亮条 */
 .file-item.selected::before {
   content: '';
   position: absolute;
-  inset: 0;
-  background: linear-gradient(to right, rgba(110, 158, 255, 0.06), transparent);
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
   pointer-events: none;
-  border-radius: inherit;
 }
 
 .file-row-top { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); position: relative; }
@@ -441,13 +444,38 @@ function polishStageText(file: any): string {
 .file-remove:hover { color: var(--danger); background: var(--danger-muted); }
 .file-row-meta { display: flex; align-items: center; justify-content: space-between; margin-top: var(--space-1); position: relative; }
 .file-meta { font-size: 10px; font-family: var(--font-mono); color: var(--text-disabled); }
-.file-status { font-size: 10px; font-weight: 500; letter-spacing: 0.02em; }
+
+/* 状态标签 */
+.file-status { font-size: 10px; font-weight: 500; letter-spacing: 0.03em; display: inline-flex; align-items: center; gap: 5px; }
+.file-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
 .s-waiting { color: var(--text-disabled); }
+.s-waiting::before { background: var(--text-disabled); }
 .s-active { color: var(--accent); }
+.s-active::before { background: var(--accent); animation: status-pulse 1.5s ease-in-out infinite; }
 .s-done { color: var(--success); }
+.s-done::before { background: var(--success); }
 .s-error { color: var(--danger); }
+.s-error::before { background: var(--danger); }
 .s-pausing { color: var(--warning); }
+.s-pausing::before { background: var(--warning); animation: status-fade 2s ease-in-out infinite; }
 .s-paused { color: var(--warning); }
+.s-paused::before { background: var(--warning); }
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes status-fade {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
 .file-error {
   font-size: 10px;
   color: var(--danger);
@@ -461,12 +489,29 @@ function polishStageText(file: any): string {
   word-break: break-all;
 }
 .file-progress { height: 2px; background: var(--border-default); border-radius: 1px; margin-top: var(--space-2); overflow: hidden; position: relative; }
-.file-progress-bar { height: 100%; background: linear-gradient(90deg, var(--accent), rgba(110, 158, 255, 0.7)); border-radius: 1px; transition: width 0.3s var(--ease-out); }
-.file-actions { display: flex; gap: var(--space-1); margin-top: var(--space-2); position: relative; }
+.file-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), rgba(110, 158, 255, 0.6));
+  border-radius: 1px;
+  transition: width 0.3s var(--ease-out);
+  position: relative;
+}
+.file-progress-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.12) 50%, transparent 100%);
+  animation: shimmer 1.5s infinite;
+}
+@keyframes shimmer {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+.file-actions { display: flex; gap: 6px; margin-top: var(--space-2); position: relative; }
 
-/* Action buttons — ghost button style */
+/* Action buttons */
 .action-btn {
-  height: 28px;
+  height: 26px;
   padding: 0 var(--space-3);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
@@ -481,14 +526,19 @@ function polishStageText(file: any): string {
 }
 .action-btn:hover { border-color: var(--border-strong); color: var(--text-primary); background: var(--bg-hover); }
 .action-btn:active { transform: scale(0.97); }
+/* 主操作：转写/重新转写 */
+.action-btn.btn-primary { color: var(--accent); border-color: var(--accent); }
+.action-btn.btn-primary:hover { background: var(--accent-muted); border-color: var(--accent-hover); }
+/* 暂停 */
 .btn-pause { color: var(--danger); border-color: var(--danger); }
-.btn-pause:hover { background: rgba(212, 91, 91, 0.1); border-color: var(--danger); }
-.btn-pausing { color: var(--warning); border-color: var(--warning); opacity: 0.6; pointer-events: none; }
-.btn-resume { color: var(--success); border-color: var(--success); }
-.btn-resume:hover { background: rgba(92, 184, 92, 0.1); border-color: var(--success); }
-.action-btn.disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; color: var(--text-disabled); }
+.btn-pause:hover { background: var(--danger-muted); border-color: var(--danger); }
+/* 正在暂停 */
+.btn-pausing { color: var(--warning); border-color: var(--warning); opacity: 0.5; cursor: not-allowed; pointer-events: none; }
+/* disabled */
+.action-btn.disabled { opacity: 0.25; cursor: not-allowed; pointer-events: none; color: var(--text-disabled); }
+
 .export-wrap { position: relative; }
-.export-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: var(--space-1); min-width: 120px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: var(--space-1); z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateY(4px) scale(0.97); pointer-events: none; transition: opacity 0.15s var(--ease-out), transform 0.15s var(--ease-out); }
+.export-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: var(--space-1); min-width: 100px; background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: var(--space-1); z-index: 200; box-shadow: 0 8px 32px rgba(0,0,0,0.25); opacity: 0; transform: translateY(4px) scale(0.97); pointer-events: none; transition: opacity 0.15s var(--ease-out), transform 0.15s var(--ease-out); }
 .export-wrap.open .export-dropdown { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
 .export-item { width: 100%; height: 26px; padding: 0 var(--space-2); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); font-size: 11px; font-family: var(--font-sans); cursor: pointer; text-align: left; white-space: nowrap; transition: background var(--duration-fast) var(--ease-out); }
 .export-item:hover { background: var(--bg-hover); }

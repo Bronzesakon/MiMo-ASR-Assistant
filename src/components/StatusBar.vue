@@ -36,10 +36,10 @@ const store = useAppStore()
 }
 
 .status-label {
-  font-size: 10px;
+  font-size: 9px;
   color: var(--text-disabled);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
 }
 
 .status-val {
@@ -52,6 +52,7 @@ const store = useAppStore()
   width: 1px;
   height: 10px;
   background: var(--border-default);
+  opacity: 0.5;
 }
 
 .status-spacer {
