@@ -27,7 +27,6 @@ src-tauri/.mimo_cache/
 
 # Large binaries (managed separately, not in repo)
 src-tauri/resources/ffmpeg.exe
-src-tauri/WebView2Loader.dll
 MicrosoftEdgeWebview2Setup.exe
 
 # Tauri generated icons (reproducible from source)
