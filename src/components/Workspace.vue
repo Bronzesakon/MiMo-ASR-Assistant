@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useAppStore } from '../stores/app'
 import { ref, watch, nextTick, computed } from 'vue'
-import { markdownToHtml } from '../utils/markdown'
+import { markdownToHtml, escapeHtml } from '../utils/markdown'
 
 const store = useAppStore()
 const textRef = ref<HTMLElement | null>(null)
@@ -11,9 +11,19 @@ const autoScrollPolished = ref(true)
 const copiedOriginal = ref(false)
 const copiedPolished = ref(false)
 
-function renderMd(text: string): string {
-  return markdownToHtml(text || '')
-}
+const transcriptionHtml = computed(() => {
+  const text = store.selectedFile?.transcription || ''
+  if (!text) return ''
+  const mode = store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain'
+  return mode === 'plain' ? escapeHtml(text) : markdownToHtml(text)
+})
+
+const polishedHtml = computed(() => {
+  const text = store.selectedFile?.polished || ''
+  if (!text) return ''
+  const mode = store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain'
+  return mode === 'plain' ? escapeHtml(text) : markdownToHtml(text)
+})
 
 // 双栏模式：文件有规整内容或正在规整中 → 显示双栏（不依赖 polishEnabledFileId）
 const showDualPanel = computed(() => {
@@ -22,6 +32,13 @@ const showDualPanel = computed(() => {
   const hasPolishState = (file.polished?.length ?? 0) > 0 || file.status === 'polishing'
   return hasPolishState && (file.transcription?.length ?? 0) > 0
 })
+
+const isTranscriptionPlain = computed(() =>
+  (store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain') === 'plain'
+)
+const isPolishPlain = computed(() =>
+  (store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain') === 'plain'
+)
 
 const hasOriginal = computed(() =>
   (store.selectedFile?.transcription?.length ?? 0) > 0
@@ -48,13 +65,13 @@ watch(showDualPanel, () => {
   })
 })
 
-// 转写内容变化 → 追踪原文面板
-watch(() => store.selectedFile?.transcription, () => {
+// 转写渲染 tick → 追踪原文面板
+watch(() => store.transcriptionRenderTick, () => {
   if (autoScrollOriginal.value) nextTick(() => textRef.value && (textRef.value.scrollTop = textRef.value.scrollHeight))
 })
 
-// 规整内容变化 → 追踪规整面板
-watch(() => store.selectedFile?.polished, () => {
+// 规整渲染 tick → 追踪规整面板
+watch(() => store.polishRenderTick, () => {
   if (autoScrollPolished.value) nextTick(() => polishRef.value && (polishRef.value.scrollTop = polishRef.value.scrollHeight))
 })
 
@@ -157,7 +174,7 @@ async function copyText(type: 'original' | 'polished') {
           </div>
         </div>
         <div ref="textRef" class="ws-body" @scroll="onScrollOriginal" @wheel="onWheelOriginal">
-          <div v-if="store.selectedFile.transcription" class="ws-text md-content" v-html="renderMd(store.selectedFile.transcription)"></div>
+          <div v-if="store.selectedFile.transcription" class="ws-text md-content" :class="{ 'ws-plain': isTranscriptionPlain }" v-html="transcriptionHtml"></div>
           <div v-else class="ws-hint">暂无内容</div>
         </div>
       </div>
@@ -176,9 +193,9 @@ async function copyText(type: 'original' | 'polished') {
           </div>
         </div>
         <div ref="polishRef" class="ws-body" @scroll="onScrollPolished" @wheel="onWheelPolished">
-          <div v-if="store.selectedFile.polished" class="ws-text md-content" v-html="renderMd(store.selectedFile.polished)"></div>
+          <div v-if="store.selectedFile.polished" class="ws-text md-content" :class="{ 'ws-plain': isPolishPlain }" v-html="polishedHtml"></div>
           <div v-else class="ws-hint">
-            <template v-if="store.selectedFile.status === 'polishing'">{{ (store.selectedFile as any).polishStage === 'sending' ? '发送中…' : (store.selectedFile as any).polishStage === 'receiving' ? '接收中…' : '规整中…' }}</template>
+            <template v-if="store.selectedFile.status === 'polishing'">{{ store.selectedFile.polishStage === 'sending' ? '发送中…' : store.selectedFile.polishStage === 'receiving' ? '接收中…' : '规整中…' }}</template>
             <template v-else>等待转写完成</template>
           </div>
         </div>
@@ -286,6 +303,7 @@ async function copyText(type: 'original' | 'polished') {
   -webkit-user-select: text;
   cursor: text;
 }
+.ws-text.ws-plain { white-space: pre-wrap; }
 
 .ws-hint {
   display: flex;

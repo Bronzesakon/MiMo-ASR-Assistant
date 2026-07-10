@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use crate::info;
+
+/// 最大重试次数（分片级）
+const MAX_RETRIES: u32 = 3;
+/// 分片重试间隔
+const RETRY_DELAY_MS: u64 = 2000;
+const CHAT_RETRY_DELAY_MS: u64 = 3000;
 
 /// 全局共享 HTTP 客户端（连接池复用，减少并发场景下 TCP 握手开销）
 pub fn http_client() -> &'static reqwest::Client {
@@ -338,6 +345,65 @@ pub async fn stream_chat(
 }
 
 // ============================================================
+// 重试包装器（供命令层调用，统一重试策略）
+// ============================================================
+
+/// 流式 ASR 转写（含分片重试：最多 3 次，间隔 2 秒）
+pub async fn transcribe_with_retry(
+    audio_data_url: &str,
+    config: &ApiConfig,
+    emitter: &impl Emitter,
+    cancelled: &AtomicBool,
+) -> Result<(), ApiError> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_RETRIES {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if attempt > 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+        match stream_transcription(audio_data_url, config, emitter, cancelled).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                crate::warn!("分片尝试 {} 失败: {}", attempt, e);
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap())
+}
+
+/// 流式聊天（含重试：最多 3 次，间隔 3 秒）
+pub async fn chat_with_retry(
+    system_prompt: &str,
+    user_text: &str,
+    audio_data_url: Option<&str>,
+    config: &ApiConfig,
+    response_format: Option<&str>,
+    emitter: &impl Emitter,
+    cancelled: &AtomicBool,
+) -> Result<(), ApiError> {
+    let mut last_error = None;
+    for attempt in 0..=MAX_RETRIES {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(CHAT_RETRY_DELAY_MS)).await;
+        }
+        match stream_chat(system_prompt, user_text, audio_data_url, config, response_format, emitter, cancelled).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                crate::warn!("chat 尝试 {} 失败: {}", attempt + 1, e);
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap())
+}
+
+// ============================================================
 // 标签过滤器（流式，处理跨 chunk 的不完整标签）
 // ============================================================
 
@@ -568,7 +634,8 @@ async fn parse_sse_stream(
 ) -> Result<(), ApiError> {
     use std::sync::atomic::Ordering;
     let stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buf = String::new();
+    let mut consumed = 0usize;
     let mut tag_filter = TagFilter::new();
 
     use futures::StreamExt;
@@ -584,7 +651,7 @@ async fn parse_sse_stream(
         let chunk_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
             Ok(opt) => match opt {
                 Some(result) => result,
-                None => break, // 流正常结束（服务端关闭连接）
+                None => break,
             },
             Err(_) => {
                 log::error!("SSE 流式响应中断: {}s 无新数据", idle_timeout.as_secs());
@@ -593,11 +660,11 @@ async fn parse_sse_stream(
         };
 
         let chunk = chunk_result.map_err(|e| ApiError::HttpError(e.to_string()))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buf.push_str(&String::from_utf8_lossy(&chunk));
 
-        while let Some(line_end) = buffer.find('\n') {
-            let line = buffer[..line_end].trim().to_string();
-            buffer = buffer[line_end + 1..].to_string();
+        while let Some(line_end) = buf[consumed..].find('\n') {
+            let line = buf[consumed..consumed + line_end].trim();
+            consumed += line_end + 1;
 
             if line.is_empty() {
                 continue;

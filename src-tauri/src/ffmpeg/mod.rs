@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
@@ -92,6 +92,97 @@ pub fn is_target_format(info: &AudioInfo) -> bool {
         && info.bits_per_sample == 16
 }
 
+// ============================================================
+// 流式重采样器（跨分段复用 SincFixedIn 内部状态）
+// ============================================================
+
+const RESAMPLE_CHUNK_SIZE: usize = 4096;
+
+struct StreamingResampler {
+    inner: SincFixedIn<f32>,
+    ratio: f64,
+}
+
+impl StreamingResampler {
+    fn new(src_rate: u32, dst_rate: u32) -> Result<Self, String> {
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let inner = SincFixedIn::<f32>::new(
+            dst_rate as f64 / src_rate as f64,
+            2.0,
+            params,
+            RESAMPLE_CHUNK_SIZE,
+            1,
+        )
+        .map_err(|e| format!("创建重采样器失败: {}", e))?;
+        Ok(Self {
+            inner,
+            ratio: dst_rate as f64 / src_rate as f64,
+        })
+    }
+
+    /// 处理一个分段。leftover_in 是上一段的余料（< chunk_size 样本）。
+    /// 返回 (重采样后的 f32, 新余料)。
+    fn process_segment(&mut self, new_samples: &[f32], leftover_in: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut combined = leftover_in.to_vec();
+        combined.extend_from_slice(new_samples);
+
+        let full_chunks = combined.len() / RESAMPLE_CHUNK_SIZE;
+        let mut output = Vec::new();
+
+        for c in 0..full_chunks {
+            let start = c * RESAMPLE_CHUNK_SIZE;
+            let chunk_data = &combined[start..start + RESAMPLE_CHUNK_SIZE];
+            if let Ok(waves_out) = self.inner.process(&[chunk_data.to_vec()], None) {
+                if let Some(ch) = waves_out.into_iter().next() {
+                    output.extend_from_slice(&ch);
+                }
+            }
+        }
+
+        let remainder_start = full_chunks * RESAMPLE_CHUNK_SIZE;
+        let new_leftover = combined[remainder_start..].to_vec();
+        (output, new_leftover)
+    }
+
+    /// 冲刷最后一段余料 + 滤波器尾部
+    fn process_final(&mut self, leftover: &[f32]) -> Vec<f32> {
+        let mut output = Vec::new();
+
+        // 处理余料（零填充至 chunk_size）
+        let mut padded = vec![0.0f32; RESAMPLE_CHUNK_SIZE];
+        let copy_len = leftover.len().min(RESAMPLE_CHUNK_SIZE);
+        padded[..copy_len].copy_from_slice(&leftover[..copy_len]);
+        if let Ok(waves_out) = self.inner.process(&[padded], None) {
+            if let Some(ch) = waves_out.into_iter().next() {
+                let valid = (leftover.len() as f64 * self.ratio).ceil() as usize;
+                output.extend_from_slice(&ch[..valid.min(ch.len())]);
+            }
+        }
+
+        // 再送一个全零 chunk 冲刷滤波器尾部
+        let zero = vec![0.0f32; RESAMPLE_CHUNK_SIZE];
+        if let Ok(waves_out) = self.inner.process(&[zero], None) {
+            if let Some(ch) = waves_out.into_iter().next() {
+                output.extend_from_slice(&ch);
+            }
+        }
+
+        output
+    }
+}
+
+// ============================================================
+// 音频转换（分段解码，30 秒一段，控制内存峰值）
+// ============================================================
+
+const SEGMENT_DURATION_SECS: f64 = 30.0;
+
 /// 将任意音频转换为 16kHz 单声道 16-bit WAV
 pub fn convert_to_wav(input_path: &Path, output_path: &Path) -> Result<(), FfmpegError> {
     if !input_path.exists() {
@@ -143,52 +234,15 @@ pub fn convert_to_wav(input_path: &Path, output_path: &Path) -> Result<(), Ffmpe
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|e| FfmpegError::FfmpegFailed(format!("创建解码器失败: {}", e)))?;
 
-    // 解码所有采样为 f32 interleaved，然后转 mono
-    let mut mono_samples: Vec<f32> = Vec::new();
-
-    loop {
-        match format_reader.next_packet() {
-            Ok(Some(packet)) => match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    // 用 copy_to_vec_interleaved 自动转换为 f32
-                    let mut interleaved = Vec::with_capacity(decoded.frames() * src_channels);
-                    decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
-
-                    if src_channels == 1 {
-                        mono_samples.extend_from_slice(&interleaved);
-                    } else {
-                        for frame in interleaved.chunks(src_channels) {
-                            let sum: f32 = frame.iter().sum();
-                            mono_samples.push(sum / src_channels as f32);
-                        }
-                    }
-                }
-                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                Err(e) => return Err(FfmpegError::FfmpegFailed(format!("解码错误: {}", e))),
-            },
-            Ok(None) => break,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => return Err(FfmpegError::FfmpegFailed(format!("读取错误: {}", e))),
-        }
-    }
-
-    if mono_samples.is_empty() {
-        return Err(FfmpegError::InvalidOutput("解码后无音频数据".to_string()));
-    }
-
-    // 重采样到 16kHz
-    let final_samples = if src_rate != 16000 {
-        resample_f32(&mono_samples, src_rate, 16000)
-            .map_err(|e| FfmpegError::FfmpegFailed(format!("重采样失败: {}", e)))?
+    // 创建重采样器（如果源采样率不是 16kHz）
+    let mut resampler = if src_rate != 16000 {
+        Some(StreamingResampler::new(src_rate, 16000)
+            .map_err(|e| FfmpegError::FfmpegFailed(e))?)
     } else {
-        mono_samples
+        None
     };
 
-    // f32 → i16 + 写 WAV
+    // 创建 WAV 写入器
     let spec = WavSpec {
         channels: 1,
         sample_rate: 16000,
@@ -197,10 +251,78 @@ pub fn convert_to_wav(input_path: &Path, output_path: &Path) -> Result<(), Ffmpe
     };
     let mut writer = WavWriter::create(output_path, spec)
         .map_err(|e| FfmpegError::FfmpegFailed(format!("创建 WAV 失败: {}", e)))?;
-    for &s in &final_samples {
-        writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
-            .map_err(|e| FfmpegError::FfmpegFailed(format!("写入 WAV 失败: {}", e)))?;
+
+    let target_per_segment = (SEGMENT_DURATION_SECS * src_rate as f64) as usize;
+    let mut leftover: Vec<f32> = Vec::new();
+    let mut eof = false;
+
+    while !eof {
+        let mut mono_segment: Vec<f32> = Vec::new();
+
+        // 解码一个分段（最多 SEGMENT_DURATION_SECS 秒）
+        loop {
+            match format_reader.next_packet() {
+                Ok(Some(packet)) => match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let mut interleaved = Vec::with_capacity(decoded.frames() * src_channels);
+                        decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
+                        if src_channels == 1 {
+                            mono_segment.extend_from_slice(&interleaved);
+                        } else {
+                            for frame in interleaved.chunks(src_channels) {
+                                mono_segment.push(frame.iter().sum::<f32>() / src_channels as f32);
+                            }
+                        }
+                    }
+                    Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                    Err(e) => return Err(FfmpegError::FfmpegFailed(format!("解码错误: {}", e))),
+                },
+                Ok(None) => { eof = true; break; }
+                Err(symphonia::core::errors::Error::IoError(ref e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    eof = true;
+                    break;
+                }
+                Err(e) => return Err(FfmpegError::FfmpegFailed(format!("读取错误: {}", e))),
+            }
+            if mono_segment.len() >= target_per_segment {
+                break;
+            }
+        }
+
+        if mono_segment.is_empty() {
+            break;
+        }
+
+        // 重采样 + 写入 WAV
+        if let Some(ref mut r) = resampler {
+            let (resampled, new_leftover) = r.process_segment(&mono_segment, &leftover);
+            leftover = new_leftover;
+            for &s in &resampled {
+                writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .map_err(|e| FfmpegError::FfmpegFailed(format!("写入 WAV 失败: {}", e)))?;
+            }
+        } else {
+            // 已是 16kHz，无需重采样，直接写入
+            for &s in &mono_segment {
+                writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .map_err(|e| FfmpegError::FfmpegFailed(format!("写入 WAV 失败: {}", e)))?;
+            }
+        }
     }
+
+    // 冲刷最后余料
+    if let Some(ref mut r) = resampler {
+        if !leftover.is_empty() {
+            let tail = r.process_final(&leftover);
+            for &s in &tail {
+                writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .map_err(|e| FfmpegError::FfmpegFailed(format!("写入 WAV 失败: {}", e)))?;
+            }
+        }
+    }
+
     writer.finalize()
         .map_err(|e| FfmpegError::FfmpegFailed(format!("完成 WAV 写入失败: {}", e)))?;
 
@@ -257,16 +379,14 @@ pub fn slice_wav(
             bits_per_sample: 16,
             sample_format: SampleFormat::Int,
         };
+        let data_size = pcm_buf.len() as u32;
         let out_file = File::create(&output_path)
             .map_err(|e| FfmpegError::FfmpegFailed(format!("创建输出失败: {}", e)))?;
-        let mut writer = WavWriter::new(BufWriter::new(out_file), out_spec)
-            .map_err(|e| FfmpegError::FfmpegFailed(format!("创建 WAV 写入器失败: {}", e)))?;
-
-        for chunk in pcm_buf.chunks_exact(2) {
-            writer.write_sample(i16::from_le_bytes([chunk[0], chunk[1]]))
-                .map_err(hound_err)?;
-        }
-        writer.finalize().map_err(hound_err)?;
+        let mut out = BufWriter::new(out_file);
+        // 直接写 WAV 头 + dump PCM 字节（跳过 hound 逐采样写入）
+        write_wav_header(&mut out, &out_spec, data_size).map_err(io_err)?;
+        out.write_all(&pcm_buf).map_err(io_err)?;
+        out.flush().map_err(io_err)?;
         return Ok(output_path);
     }
 
@@ -347,57 +467,6 @@ pub fn get_duration(path: &Path) -> Result<f64, FfmpegError> {
 // 内部辅助
 // ============================================================
 
-/// f32 mono 重采样
-fn resample_f32(input: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>, String> {
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
-
-    let chunk_size = input.len().min(4096).max(64);
-    let mut resampler = SincFixedIn::<f32>::new(
-        dst_rate as f64 / src_rate as f64,
-        2.0,
-        params,
-        chunk_size,
-        1,
-    )
-    .map_err(|e| format!("创建重采样器失败: {}", e))?;
-
-    let mut output = Vec::new();
-    let mut pos = 0;
-
-    while pos < input.len() {
-        let end = (pos + chunk_size).min(input.len());
-        let chunk_len = end - pos;
-
-        let mut padded = vec![0.0f32; chunk_size];
-        padded[..chunk_len].copy_from_slice(&input[pos..end]);
-
-        let waves_in = vec![padded];
-        let waves_out = resampler
-            .process(&waves_in, None)
-            .map_err(|e| format!("重采样执行失败: {}", e))?;
-
-        if let Some(channel_out) = waves_out.into_iter().next() {
-            if pos + chunk_size >= input.len() {
-                let ratio = dst_rate as f64 / src_rate as f64;
-                let valid_out = (chunk_len as f64 * ratio).ceil() as usize;
-                output.extend_from_slice(&channel_out[..valid_out.min(channel_out.len())]);
-            } else {
-                output.extend_from_slice(&channel_out);
-            }
-        }
-
-        pos = end;
-    }
-
-    Ok(output)
-}
-
 struct WavDataInfo { data_offset: u64 }
 
 fn read_wav_data_offset<R: Read + Seek>(reader: &mut R) -> Result<WavDataInfo, FfmpegError> {
@@ -439,4 +508,25 @@ fn io_err(e: std::io::Error) -> FfmpegError {
 
 fn hound_err(e: hound::Error) -> FfmpegError {
     FfmpegError::FfmpegFailed(e.to_string())
+}
+
+/// 直接写 WAV 文件头（44 bytes），跳过 hound 逐采样写入
+fn write_wav_header<W: std::io::Write>(w: &mut W, spec: &WavSpec, data_size: u32) -> std::io::Result<()> {
+    let byte_rate = spec.sample_rate * spec.channels as u32 * (spec.bits_per_sample / 8) as u32;
+    let block_align = spec.channels as u16 * (spec.bits_per_sample / 8) as u16;
+    let riff_size = 36u32 + data_size;
+    w.write_all(b"RIFF")?;
+    w.write_all(&riff_size.to_le_bytes())?;
+    w.write_all(b"WAVE")?;
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?;
+    w.write_all(&spec.channels.to_le_bytes())?;
+    w.write_all(&spec.sample_rate.to_le_bytes())?;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&block_align.to_le_bytes())?;
+    w.write_all(&spec.bits_per_sample.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_size.to_le_bytes())?;
+    Ok(())
 }

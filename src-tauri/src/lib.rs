@@ -6,6 +6,7 @@ mod provider;
 mod log;
 mod dpapi;
 mod rate_limiter;
+mod base64;
 
 use api::Emitter;
 use serde::{Deserialize, Serialize};
@@ -156,28 +157,17 @@ async fn resume_transcription(
         let _permit = limiter.0.acquire_permit().await;
 
         let slice_start = std::time::Instant::now();
-        let mut last_error = None;
 
-        for attempt in 1..=3u32 {
-            if attempt > 1 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        match api::transcribe_with_retry(&data_url, &config, &tagged_emitter, &cancelled).await {
+            Ok(()) => {}
+            Err(e) => {
+                error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
+                let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
+                let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
+                let registry = handle.state::<TaskRegistry>();
+                registry.tasks.lock().await.remove(&file_id);
+                return Err(e.to_string());
             }
-            match api::stream_transcription(&data_url, &config, &tagged_emitter, &cancelled).await {
-                Ok(_) => { last_error = None; break; }
-                Err(e) => {
-                    warn!("[{}] 片段 {} 尝试 {} 失败: {}", file_name, index, attempt, e);
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        if let Some(e) = last_error {
-            error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
-            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-            let registry = handle.state::<TaskRegistry>();
-            registry.tasks.lock().await.remove(&file_id);
-            return Err(e.to_string());
         }
 
         // 发射状态更新
@@ -347,7 +337,15 @@ fn load_config() -> AppConfig {
     let config = if path.exists() {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let mut config: AppConfig = serde_json::from_str(&content).unwrap_or_default();
+                let mut config: AppConfig = match serde_json::from_str(&content) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("config.json 解析失败: {}，使用默认配置", e);
+                        let bak = path.with_extension("json.bak");
+                        let _ = std::fs::write(&bak, &content);
+                        AppConfig::default()
+                    }
+                };
                 // 迁移旧配置：无 asr_provider 时从旧 provider 推导
                 if config.asr_provider.is_empty() {
                     config.asr_provider = if config.provider == "deepseek" {
@@ -498,7 +496,7 @@ async fn process_and_transcribe(
     }).to_string());
 
     // channel：blocking task → async context，缓冲 8 个分片
-    let (tx, rx) = tokio::sync::mpsc::channel::<(u32, u32, String)>(8);
+    let (tx, rx) = tokio::sync::mpsc::channel::<(u32, u32, String)>(4);
     let mut rx = Some(rx);
 
     // 临时目录由本函数管理，确保取消时也能清理
@@ -536,30 +534,18 @@ async fn process_and_transcribe(
         let _ = plain_emitter.emit("transcription-progress", &progress_json.to_string());
 
         // 获取速率许可
-        let _permit = limiter.0.acquire_permit().await;
+        let _rate_permit = limiter.0.acquire_permit().await;
 
-        let mut last_error = None;
-
-        for attempt in 1..=3u32 {
-            if attempt > 1 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            match api::stream_transcription(&data_url, &config, &tagged_emitter, &cancelled).await {
-                Ok(_) => { last_error = None; break; }
-                Err(e) => {
-                    warn!("[{}] 片段 {} 尝试 {} 失败: {}", file_name, index, attempt, e);
-                    last_error = Some(e);
-                }
+        match api::transcribe_with_retry(&data_url, &config, &tagged_emitter, &cancelled).await {
+            Ok(()) => {}
+            Err(e) => {
+                error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
+                let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
+                let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
+                return Err(e.to_string());
             }
         }
         // data_url 在此 drop，释放 ~9MB 内存
-
-        if let Some(e) = last_error {
-            error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
-            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-            return Err(e.to_string());
-        }
 
         // 分片成功后检查暂停
         if pause_flag.load(Ordering::Acquire) {
@@ -649,47 +635,20 @@ async fn start_chat(
     };
     let final_system_prompt = prompt::build_prompt(&template, "");
 
-    let max_retries = 2;
-    let mut last_error = None;
+    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
 
-    for attempt in 0..=max_retries {
-        if cancelled.load(Ordering::Acquire) { break; }
-
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-
-        // 每次重试需要新的 emitter（SSE 流式状态不可复用）
-        let retry_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
-
-        match api::stream_chat(
-            &final_system_prompt,
-            &user_text,
-            audio_data_url.as_deref(),
-            &config,
-            response_format.as_deref(),
-            &retry_emitter,
-            &cancelled,
-        ).await {
-            Ok(()) => {
-                let is_cancelled = cancelled.load(Ordering::Acquire);
-                {
-                    let registry = handle.state::<TaskRegistry>();
-                    registry.tasks.lock().await.remove(&file_id);
-                }
-                if is_cancelled {
-                    info!("[{}] start_chat 已取消", file_name);
-                    return Ok(());
-                }
-                let complete_json = serde_json::json!({ "file_id": file_id });
-                let _ = plain_emitter.emit("chat-complete", &complete_json.to_string());
-                info!("[{}] start_chat 完成", file_name);
-                return Ok(());
-            }
-            Err(e) => {
-                warn!("[{}] start_chat 尝试 {} 失败: {}", file_name, attempt + 1, e);
-                last_error = Some(e);
-            }
+    match api::chat_with_retry(
+        &final_system_prompt, &user_text, audio_data_url.as_deref(),
+        &config, response_format.as_deref(), &tagged_emitter, &cancelled,
+    ).await {
+        Ok(()) => {}
+        Err(e) => {
+            let registry = handle.state::<TaskRegistry>();
+            registry.tasks.lock().await.remove(&file_id);
+            error!("[{}] start_chat 最终失败: {} (模型={}, 文本长度={})", file_id, e, config.model, user_text.len());
+            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
+            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
+            return Err(e.to_string());
         }
     }
 
@@ -704,11 +663,10 @@ async fn start_chat(
         return Ok(());
     }
 
-    let e = last_error.unwrap();
-    error!("[{}] start_chat 最终失败 (已重试 {} 次): {} (模型={}, 文本长度={})", file_id, max_retries, e, config.model, user_text.len());
-    let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-    let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-    Err(e.to_string())
+    let complete_json = serde_json::json!({ "file_id": file_id });
+    let _ = plain_emitter.emit("chat-complete", &complete_json.to_string());
+    info!("[{}] start_chat 完成", file_name);
+    Ok(())
 }
 
 /// 隐藏主窗口（最小化到托盘）

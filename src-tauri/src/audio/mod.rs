@@ -1,5 +1,6 @@
 use std::path::Path;
 use crate::ffmpeg;
+use crate::base64;
 use crate::{info, error, warn};
 
 const MAX_CHUNK_SECONDS: u32 = 150;
@@ -118,7 +119,7 @@ pub fn convert_and_slice(
 
     while current_time < total_duration {
         let remaining = total_duration - current_time;
-        if remaining < 1.0 {
+        if remaining < 0.2 {
             break;
         }
         let mut this_sec = (chunk_sec as f64).min(remaining);
@@ -132,7 +133,7 @@ pub fn convert_and_slice(
         loop {
             slice_path = ffmpeg::slice_wav(&wav_path, temp_dir, current_time, this_sec)?;
             audio_bytes = std::fs::read(&slice_path)?;
-            b64_len = base64_encoded_len(audio_bytes.len());
+            b64_len = base64::base64_encoded_len(audio_bytes.len());
 
             if b64_len <= MAX_BASE64_BYTES {
                 break;
@@ -148,7 +149,7 @@ pub fn convert_and_slice(
             warn!("[{}] 分片 {} Base64={:.1}MB 超限，缩短至 {:.1}s", file_name, chunk_index, b64_len as f64 / 1024.0 / 1024.0, this_sec);
         }
 
-        let base64_str = base64_encode(&audio_bytes);
+        let base64_str = base64::base64_encode(&audio_bytes);
         let data_url = format!("data:audio/wav;base64,{}", base64_str);
         // 立即通过回调交出 data_url，本函数不再持有引用
         callback(chunk_index + 1, estimated_total, data_url);
@@ -211,42 +212,8 @@ pub fn collect_slice_files(temp_dir: &std::path::Path) -> Vec<(f64, std::path::P
 /// 读取切片 WAV 文件并编码为 data URL
 pub fn encode_slice_to_data_url(slice_path: &std::path::Path) -> Result<String, AudioError> {
     let audio_bytes = std::fs::read(slice_path)?;
-    let base64_str = base64_encode(&audio_bytes);
+    let base64_str = base64::base64_encode(&audio_bytes);
     Ok(format!("data:audio/wav;base64,{}", base64_str))
-}
-
-fn base64_encoded_len(input_len: usize) -> usize {
-    (input_len + 2) / 3 * 4
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
-
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-
-        if chunk.len() > 1 {
-            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-
-        if chunk.len() > 2 {
-            result.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -255,18 +222,18 @@ mod tests {
 
     #[test]
     fn test_base64_encode() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64::base64_encode(b""), "");
+        assert_eq!(base64::base64_encode(b"f"), "Zg==");
+        assert_eq!(base64::base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64::base64_encode(b"foo"), "Zm9v");
     }
 
     #[test]
     fn test_base64_encoded_len() {
-        assert_eq!(base64_encoded_len(0), 0);
-        assert_eq!(base64_encoded_len(1), 4);
-        assert_eq!(base64_encoded_len(2), 4);
-        assert_eq!(base64_encoded_len(3), 4);
-        assert_eq!(base64_encoded_len(4), 8);
+        assert_eq!(base64::base64_encoded_len(0), 0);
+        assert_eq!(base64::base64_encoded_len(1), 4);
+        assert_eq!(base64::base64_encoded_len(2), 4);
+        assert_eq!(base64::base64_encoded_len(3), 4);
+        assert_eq!(base64::base64_encoded_len(4), 8);
     }
 }

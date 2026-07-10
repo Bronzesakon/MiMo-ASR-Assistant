@@ -151,6 +151,7 @@ async function transcribeFile(fileId: string, language: string) {
     tempDir: undefined, lastCompletedIndex: undefined, resumeTotal: undefined,
     language,
   })
+  store.fileRenderMode.delete(fileId)
   store.isTranscribing = true
 
   const state = store.ensureFileState(fileId)
@@ -223,6 +224,15 @@ async function polishFile(fileId: string) {
     store.updateFile(fileId, { status: 'completed', polishStage: 'failed', error: errMsg })
     store.showToastMessage(`${file?.name || '文件'} 规整失败`, 'error')
   }
+}
+
+async function stopPolish(fileId: string) {
+  closeAllDropdowns()
+  const file = store.files.find(f => f.id === fileId)
+  if (!file || file.status !== 'polishing') return
+  store.requestCancelFile(fileId)
+  store.updateFile(fileId, { status: 'completed', polishStage: 'failed', error: undefined })
+  store.showToastMessage(`${file.name} 已停止规整`, 'info')
 }
 
 async function exportFile(fileId: string, type: 'original' | 'polished') {
@@ -311,7 +321,7 @@ function polishStageText(file: any): string {
         </div>
         <div v-if="f.error" class="file-error" :title="f.error">{{ f.error }}</div>
 
-        <div v-if="['transcribing','polishing','pausing','paused'].includes(f.status)" class="file-progress">
+        <div v-if="['transcribing','pausing','paused'].includes(f.status)" class="file-progress">
           <div class="file-progress-bar" :style="{ width: f.progress + '%' }" />
         </div>
 
@@ -342,10 +352,16 @@ function polishStageText(file: any): string {
             {{ (f.status === 'completed' || f.status === 'failed' || f.status === 'polishing') ? '重新转写' : '转写' }}
           </button>
 
-          <!-- AI规整按钮 -->
-          <button
+          <!-- AI规整 / 停止规整 -->
+          <button v-if="f.status === 'polishing'"
+            class="action-btn btn-pause"
+            @click.stop="stopPolish(f.id)"
+          >
+            停止规整
+          </button>
+          <button v-else
             class="action-btn"
-            :class="{ disabled: !f.transcription || ['transcribing','processing','pausing','polishing','waiting'].includes(f.status) }"
+            :class="{ disabled: !f.transcription || ['transcribing','processing','pausing','waiting'].includes(f.status) }"
             @click.stop="polishFile(f.id)"
           >
             {{ f.polished ? '重新规整' : 'AI 规整' }}

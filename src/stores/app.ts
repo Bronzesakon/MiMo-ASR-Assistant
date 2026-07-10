@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { FileInfo, ApiConfig, CustomProvider, CustomModelOption } from '../types'
+import { needsMarkdownParsing } from '../utils/markdown'
 
 const PROVIDER_URLS: Record<string, string> = {
   'mimo-api': 'https://api.xiaomimimo.com/v1',
@@ -88,6 +89,39 @@ export const useAppStore = defineStore('app', () => {
 
   const globalTokenCount = ref(0)
   const speedTick = ref(0)
+
+  // 渲染节流：流式 chunk 到达时不立即触发渲染，等待 150ms 静默后再重绘
+  const transcriptionRenderTick = ref(0)
+  const polishRenderTick = ref(0)
+  const DEBOUNCE_MS = 150
+  const renderTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // upgrade-only 标记：一旦检测到 Markdown 语法，本文件本次转写/规整锁定为 markdown 模式
+  const fileRenderMode = new Map<string, 'plain' | 'markdown'>()
+
+  function scheduleRender(fileId: string, type: 'transcription' | 'polish', delta: string) {
+    const mode = fileRenderMode.get(fileId) || 'plain'
+    if (mode === 'plain' && needsMarkdownParsing(delta)) {
+      fileRenderMode.set(fileId, 'markdown')
+    }
+    const key = `${fileId}_${type}`
+    const existing = renderTimers.get(key)
+    if (existing) clearTimeout(existing)
+    renderTimers.set(key, setTimeout(() => {
+      renderTimers.delete(key)
+      if (type === 'transcription') transcriptionRenderTick.value++
+      else polishRenderTick.value++
+    }, DEBOUNCE_MS))
+  }
+
+  function flushRender(fileId: string) {
+    for (const type of ['transcription', 'polish'] as const) {
+      const key = `${fileId}_${type}`
+      const timer = renderTimers.get(key)
+      if (timer) { clearTimeout(timer); renderTimers.delete(key) }
+    }
+    transcriptionRenderTick.value++
+    polishRenderTick.value++
+  }
 
   const selectedFile = computed(() =>
     files.value.find(f => f.id === selectedFileId.value) || null
@@ -221,6 +255,10 @@ export const useAppStore = defineStore('app', () => {
   }
 
   function addFile(file: FileInfo) {
+    if (files.value.some(f => f.path === file.path)) {
+      showToastMessage(`${file.name} 已在列表中`, 'info')
+      return
+    }
     files.value.push(file)
     if (!selectedFileId.value) selectedFileId.value = file.id
     console.log(`[文件] 导入: ${file.name}, 时长=${file.duration.toFixed(1)}s, id=${file.id}`)
@@ -231,6 +269,8 @@ export const useAppStore = defineStore('app', () => {
     if (index > -1) {
       files.value.splice(index, 1)
       fileStates.delete(id)
+      fileRenderMode.delete(id)
+      flushRender(id)
       if (selectedFileId.value === id) selectedFileId.value = files.value[0]?.id || null
     }
   }
@@ -290,6 +330,7 @@ export const useAppStore = defineStore('app', () => {
         const state = ensureFileState(fileId)
         state.outputCharCount += text.length
         state.transcriptionChunks++
+        scheduleRender(fileId, 'transcription', text)
       } catch (e) {
         console.error('[事件] transcription-chunk 解析失败:', e)
       }
@@ -335,6 +376,7 @@ export const useAppStore = defineStore('app', () => {
           console.log(`[转写] 完成: ${file.name}, 字数=${file.transcriptionWordCount}`)
         }
         fileStates.delete(fileId)
+        flushRender(fileId)
         isTranscribing.value = files.value.some(f => f.status === 'transcribing' || f.status === 'processing')
         if (fileId === selectedFileId.value) showToastMessage(`${file?.name || '文件'} 转写完成`, 'success')
       } catch (e) {
@@ -355,6 +397,7 @@ export const useAppStore = defineStore('app', () => {
           file.resumeTotal = data.total
           file.transcriptionWordCount = countWords(file.transcription)
         }
+        flushRender(fileId)
         // 不删除 fileStates：保留 transcriptionChunks 等状态供 resume 时进度计算
         isTranscribing.value = files.value.some(f =>
           f.status === 'transcribing' || f.status === 'processing' || f.status === 'pausing'
@@ -399,10 +442,10 @@ export const useAppStore = defineStore('app', () => {
         const state = ensureFileState(fileId)
         if (!state.polishFirstChunk) {
           state.polishFirstChunk = true
-          // 更新 UI 状态为"接收中"
-          if (file) updateFile(fileId, { polishStage: 'receiving' } as any)
+          if (file) updateFile(fileId, { polishStage: 'receiving' })
         }
         state.polishChunkCount++
+        scheduleRender(fileId, 'polish', text)
       } catch (e) {
         console.error('[事件] chat-chunk 解析失败:', e)
       }
@@ -418,10 +461,10 @@ export const useAppStore = defineStore('app', () => {
           if (file.status === 'polishing') file.status = 'completed'
           file.error = undefined
           file.polishedWordCount = countWords(file.polished)
+          file.polishStage = 'idle'
           console.log(`[规整] 完成: ${file.name}, 字数=${file.polishedWordCount}`)
         }
-        // 清理 polishStage
-        if (file) (file as any).polishStage = 'idle'
+        flushRender(fileId)
         if (fileId === selectedFileId.value) showToastMessage(`${file?.name || '文件'} 规整完成`, 'success')
       } catch (e) {
         console.error('[事件] chat-complete 解析失败:', e)
@@ -581,5 +624,7 @@ export const useAppStore = defineStore('app', () => {
     addCustomProvider, updateCustomProvider, removeCustomProvider,
     polishProviderOptions, customPolishModels,
     getCustomOptionValue, isCustomProvider, getCustomProvider,
+    transcriptionRenderTick, polishRenderTick,
+    fileRenderMode, scheduleRender, flushRender,
   }
 })
