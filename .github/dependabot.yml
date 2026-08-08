@@ -1,0 +1,34 @@
+# 清单 I-02：依赖自动更新（Dependabot）
+#
+# 治理规则（按清单 I-02 原文）：
+# - npm 与 Cargo 生态分开配置，每周运行，限制同时打开的 PR 数。
+# - Dependabot 只创建 PR，绝不自动合并；安全更新（Dependabot alerts）
+#   优先于版本更新处理。
+# - 涉及以下高风险依赖的【主版本】变更必须人工审查并跑全部门禁后再合入，
+#   不得直接合并：
+#     npm : @tauri-apps/*、marked、dompurify
+#     cargo: tauri / tauri-*、reqwest、hound、url、base64
+#   （保护名单已移除 symphonia/rubato —— 二者随纯 Rust 解码方案移除。）
+# - 所有依赖 PR 必须通过 CI 全部 job（frontend / rust / security）；
+#   涉及解析器、网络栈、Markdown 消毒或 Tauri 权限的更新还需执行对应
+#   安全回归测试（见 README「发布检查清单」冒烟项）。
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - npm
+
+  - package-ecosystem: cargo
+    directory: "/src-tauri"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust

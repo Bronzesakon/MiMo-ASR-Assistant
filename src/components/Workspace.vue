@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { useAppStore } from '../stores/app'
-import { ref, watch, nextTick, computed } from 'vue'
-import { markdownToHtml, escapeHtml } from '../utils/markdown'
+import { useFilesStore } from '../stores/files'
+import { ref, watch, nextTick, computed, onMounted, onUnmounted } from 'vue'
+import { markdownToHtml, escapeHtml, needsMarkdownParsing } from '../utils/markdown'
 
-const store = useAppStore()
+const store = useFilesStore()
 const textRef = ref<HTMLElement | null>(null)
 const polishRef = ref<HTMLElement | null>(null)
 const autoScrollOriginal = ref(true)
@@ -11,18 +11,20 @@ const autoScrollPolished = ref(true)
 const copiedOriginal = ref(false)
 const copiedPolished = ref(false)
 
+// 清单 F-01：markdownToHtml 内部已经 DOMPurify 消毒；escapeHtml 路径天然安全。
+// 渲染模式实时按内容判定（不再依赖完成后才切换的非响应式 Map）：
+// 含 markdown 语法则渲染为 HTML，否则走纯文本转义。这样流式输出时 `# 标题`
+// 换行后即渲染为标题，任务完成后也无需额外切换模式。
 const transcriptionHtml = computed(() => {
   const text = store.selectedFile?.transcription || ''
   if (!text) return ''
-  const mode = store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain'
-  return mode === 'plain' ? escapeHtml(text) : markdownToHtml(text)
+  return needsMarkdownParsing(text) ? markdownToHtml(text) : escapeHtml(text)
 })
 
 const polishedHtml = computed(() => {
   const text = store.selectedFile?.polished || ''
   if (!text) return ''
-  const mode = store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain'
-  return mode === 'plain' ? escapeHtml(text) : markdownToHtml(text)
+  return needsMarkdownParsing(text) ? markdownToHtml(text) : escapeHtml(text)
 })
 
 // 双栏模式：文件有规整内容或正在规整中 → 显示双栏（不依赖 polishEnabledFileId）
@@ -34,10 +36,10 @@ const showDualPanel = computed(() => {
 })
 
 const isTranscriptionPlain = computed(() =>
-  (store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain') === 'plain'
+  !needsMarkdownParsing(store.selectedFile?.transcription || '')
 )
 const isPolishPlain = computed(() =>
-  (store.fileRenderMode.get(store.selectedFile?.id || '') || 'plain') === 'plain'
+  !needsMarkdownParsing(store.selectedFile?.polished || '')
 )
 
 const hasOriginal = computed(() =>
@@ -51,10 +53,50 @@ function isAtBottom(el: HTMLElement): boolean {
   return Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 60
 }
 
+// 行满即时跟踪（修复换行后新行被底部遮挡）：
+// store 的渲染 tick 带 150ms debounce，持续输出时会被不断重置，只有停顿≥150ms
+// 才触发滚动，导致文本行满换行时界面不下移。改用 MutationObserver 监听文本容器，
+// 内容变化（含换行）时若处于自动跟踪状态就立即滚到底（rAF 合并同帧多次变化）。
+let originalObserver: MutationObserver | null = null
+let polishObserver: MutationObserver | null = null
+let scrollRaf = 0
+
+function scrollTrack(el: HTMLElement | null, enabled: () => boolean) {
+  cancelAnimationFrame(scrollRaf)
+  scrollRaf = requestAnimationFrame(() => {
+    if (el && enabled()) el.scrollTop = el.scrollHeight
+  })
+}
+
+function setupTrackers() {
+  originalObserver?.disconnect()
+  polishObserver?.disconnect()
+  if (textRef.value) {
+    originalObserver = new MutationObserver(() =>
+      scrollTrack(textRef.value, () => autoScrollOriginal.value)
+    )
+    originalObserver.observe(textRef.value, { childList: true, characterData: true, subtree: true })
+  }
+  if (polishRef.value) {
+    polishObserver = new MutationObserver(() =>
+      scrollTrack(polishRef.value, () => autoScrollPolished.value)
+    )
+    polishObserver.observe(polishRef.value, { childList: true, characterData: true, subtree: true })
+  }
+}
+
+onMounted(() => setupTrackers())
+onUnmounted(() => {
+  originalObserver?.disconnect()
+  polishObserver?.disconnect()
+  cancelAnimationFrame(scrollRaf)
+})
+
 // 切换文件时重置两个面板
 watch(() => store.selectedFileId, () => {
   autoScrollOriginal.value = true
   autoScrollPolished.value = true
+  nextTick(() => setupTrackers())
 })
 
 // 单栏↔双栏切换时，根据实际 scrollTop 重新判定追踪状态
@@ -62,6 +104,7 @@ watch(showDualPanel, () => {
   nextTick(() => {
     if (textRef.value) autoScrollOriginal.value = isAtBottom(textRef.value)
     if (polishRef.value) autoScrollPolished.value = isAtBottom(polishRef.value)
+    setupTrackers()
   })
 })
 
@@ -75,30 +118,35 @@ watch(() => store.polishRenderTick, () => {
   if (autoScrollPolished.value) nextTick(() => polishRef.value && (polishRef.value.scrollTop = polishRef.value.scrollHeight))
 })
 
-function onScrollOriginal() {
-  if (textRef.value) autoScrollOriginal.value = isAtBottom(textRef.value)
+// 追踪状态滞回（修复「跳转到底部」按钮在滑动时反复闪烁）：
+// 追踪中需滚离底部超过 SCROLL_LEAVE_GAP 才关闭；关闭后需滚回距底部
+// SCROLL_RETURN_GAP 内才重新开启。中间死区内保持原状态，避免在阈值附近
+// 因 scrollTop 抖动反复切换，导致按钮出现/消失闪烁。
+const SCROLL_LEAVE_GAP = 60
+const SCROLL_RETURN_GAP = 8
+
+function updateScroll(el: HTMLElement | null, flag: { value: boolean }): void {
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  if (flag.value) {
+    if (gap > SCROLL_LEAVE_GAP) flag.value = false
+  } else if (gap < SCROLL_RETURN_GAP) {
+    flag.value = true
+  }
 }
 
-function onScrollPolished() {
-  if (polishRef.value) autoScrollPolished.value = isAtBottom(polishRef.value)
-}
+function onScrollOriginal() { updateScroll(textRef.value, autoScrollOriginal) }
 
-function onWheelOriginal(e: WheelEvent) {
-  if (e.deltaY < 0) autoScrollOriginal.value = false
-}
-
-function onWheelPolished(e: WheelEvent) {
-  if (e.deltaY < 0) autoScrollPolished.value = false
-}
+function onScrollPolished() { updateScroll(polishRef.value, autoScrollPolished) }
 
 function goBottomOriginal() {
   autoScrollOriginal.value = true
-  textRef.value && (textRef.value.scrollTop = textRef.value.scrollHeight)
+  if (textRef.value) textRef.value.scrollTop = textRef.value.scrollHeight
 }
 
 function goBottomPolished() {
   autoScrollPolished.value = true
-  polishRef.value && (polishRef.value.scrollTop = polishRef.value.scrollHeight)
+  if (polishRef.value) polishRef.value.scrollTop = polishRef.value.scrollHeight
 }
 
 async function copyText(type: 'original' | 'polished') {
@@ -146,7 +194,7 @@ async function copyText(type: 'original' | 'polished') {
           </button>
         </div>
       </div>
-      <div ref="textRef" class="ws-body" @scroll="onScrollOriginal" @wheel="onWheelOriginal">
+      <div ref="textRef" class="ws-body" @scroll="onScrollOriginal">
         <div v-if="store.selectedFile.transcription" class="ws-text">{{ store.selectedFile.transcription }}</div>
         <div v-else class="ws-hint">
           <template v-if="store.selectedFile.status === 'waiting'">点击左侧"转写"按钮开始</template>
@@ -173,7 +221,7 @@ async function copyText(type: 'original' | 'polished') {
             </button>
           </div>
         </div>
-        <div ref="textRef" class="ws-body" @scroll="onScrollOriginal" @wheel="onWheelOriginal">
+        <div ref="textRef" class="ws-body" @scroll="onScrollOriginal">
           <div v-if="store.selectedFile.transcription" class="ws-text md-content" :class="{ 'ws-plain': isTranscriptionPlain }" v-html="transcriptionHtml"></div>
           <div v-else class="ws-hint">暂无内容</div>
         </div>
@@ -192,7 +240,7 @@ async function copyText(type: 'original' | 'polished') {
             </button>
           </div>
         </div>
-        <div ref="polishRef" class="ws-body" @scroll="onScrollPolished" @wheel="onWheelPolished">
+        <div ref="polishRef" class="ws-body" @scroll="onScrollPolished">
           <div v-if="store.selectedFile.polished" class="ws-text md-content" :class="{ 'ws-plain': isPolishPlain }" v-html="polishedHtml"></div>
           <div v-else class="ws-hint">
             <template v-if="store.selectedFile.status === 'polishing'">{{ store.selectedFile.polishStage === 'sending' ? '发送中…' : store.selectedFile.polishStage === 'receiving' ? '接收中…' : '规整中…' }}</template>

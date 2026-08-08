@@ -8,16 +8,15 @@
     "core:window:allow-minimize",
     "core:window:allow-maximize",
     "core:window:allow-unmaximize",
-    "core:window:allow-close",
     "core:window:allow-toggle-maximize",
-    "core:window:allow-set-focus",
     "core:window:allow-start-dragging",
-    "opener:default",
-    "dialog:default",
     "dialog:allow-open",
-    "dialog:allow-save",
-    "dialog:allow-ask",
-    "dialog:allow-confirm",
-    "dialog:allow-message"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://platform.xiaomimimo.com/**" },
+        { "url": "https://platform.deepseek.com/**" }
+      ]
+    }
   ]
 }

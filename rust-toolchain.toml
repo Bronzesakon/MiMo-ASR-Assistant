@@ -1,0 +1,6 @@
+# 清单 I-02：固定 Rust 工具链 channel 与组件，保证本地 / CI 一致。
+# CI（.github/workflows/ci.yml）的 Windows runner 通过 rustup 自动遵循本文件。
+# 最低要求：Rust 1.96+（README 前置依赖声明），当前按 stable channel 收口。
+[toolchain]
+channel = "stable"
+components = ["clippy"]

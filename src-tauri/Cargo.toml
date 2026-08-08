@@ -1,6 +1,6 @@
 [package]
 name = "mimo-asr-assistant"
-version = "1.1.3"
+version = "1.1.4"
 description = "语音转文字工具"
 authors = ["you"]
 edition = "2021"
@@ -22,19 +22,21 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-symphonia = { version = "0.6", default-features = false, features = [
-    "mp3", "aac", "flac", "vorbis", "wav", "pcm",
-    "isomp4", "ogg",
-    "all-meta",
-] }
 hound = "3.5"
-rubato = "0.16"
 log = "0.4"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-tokio = { version = "1", features = ["full"] }
+# test-util 仅启用既有 tokio 依赖的 feature（非新增 crate）：
+# 为 B-07/B-08 重试/取消单测提供 start_paused 虚拟时间，避免真实等待退避
+tokio = { version = "1", features = ["full", "test-util"] }
 futures = "0.3"
 dirs = "5"
 chrono = "0.4"
+# S-02：结构化 URL 解析（清单明确批准的依赖）
+url = "2"
+# B-07：统一错误体系（清单 B-07 批准的唯一新依赖）
+thiserror = "2"
+# B-10：base64 编码性能（清单 B-10 批准的唯一新依赖）
+base64 = "0.22"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -21,13 +21,34 @@ desktop.ini
 *.log
 src-tauri/log/
 
+# Local review/debug artifacts (C-02)
+.review_*
+
 # Runtime generated
 src-tauri/config.json
 src-tauri/.mimo_cache/
 
+# Environment & local overrides
+.env
+.env.*
+!.env.example
+*.local
+
+# Backup / merge residues
+*.bak
+*.orig
+*.rej
+
+# Test coverage output
+coverage/
+.nyc_output/
+
 # Large binaries (managed separately, not in repo)
-src-tauri/resources/ffmpeg.exe
 MicrosoftEdgeWebview2Setup.exe
+
+# Bundled slim ffmpeg (tracked in repo, integrity-gated by build.rs)
+# src-tauri/resources/ffmpeg.exe
+# src-tauri/resources/ffmpeg.exe.sha256
 
 # Tauri generated icons (reproducible from source)
 src-tauri/icons/Square*.png
@@ -49,5 +70,7 @@ reasonix.toml
 API接口规范文档.md
 CLAUDE.md
 项目文档.md
-RELEASE_v1.1.0.md
 skills-lock.json
+
+# Release notes (collected under one folder, not tracked)
+release说明文档/

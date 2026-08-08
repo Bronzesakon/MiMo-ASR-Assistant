@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { useAppStore } from '../stores/app'
+import { useUiStore } from '../stores/ui'
 import type { CustomProvider } from '../types'
 
 const props = defineProps<{
@@ -14,7 +14,7 @@ const emit = defineEmits<{
   (e: 'close'): void
 }>()
 
-const store = useAppStore()
+const store = useUiStore()
 
 const name = ref('')
 const baseUrl = ref('')

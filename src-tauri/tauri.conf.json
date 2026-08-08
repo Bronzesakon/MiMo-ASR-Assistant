@@ -1,17 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MiMo ASR Assistant",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "identifier": "com.mimo.asr.assistant",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npx vite build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: https://asset.localhost; connect-src 'self' ipc: http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-src 'none'"
     }
   },
   "bundle": {
@@ -25,7 +25,9 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "WebView2Loader.dll"
+      "WebView2Loader.dll",
+      "resources/ffmpeg.exe",
+      "resources/ffmpeg.exe.sha256"
     ],
     "windows": {
       "nsis": {

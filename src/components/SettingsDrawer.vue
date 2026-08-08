@@ -1,12 +1,21 @@
 <script setup lang="ts">
-import { useAppStore } from '../stores/app'
+import { useSettingsStore } from '../stores/settings'
+import { useFilesStore } from '../stores/files'
+import { useUiStore } from '../stores/ui'
 import { invoke } from '@tauri-apps/api/core'
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, watch } from 'vue'
+import { openExternalUrl } from '../utils/externalLink'
 import CustomSelect from './CustomSelect.vue'
 import CustomProviderModal from './CustomProviderModal.vue'
+import PromptManager from './PromptManager.vue'
+import { useCapabilitiesStore } from '../stores/capabilities'
 import type { CustomProvider } from '../types'
 
-const store = useAppStore()
+const store = useSettingsStore()
+const files = useFilesStore()
+const ui = useUiStore()
+const caps = useCapabilitiesStore()
+const promptManagerRef = ref<InstanceType<typeof PromptManager> | null>(null)
 const showAsrKey = ref(false)
 const showPolishKey = ref(false)
 const showHelp = reactive<Record<string, boolean>>({ asrKey: false, polishKey: false })
@@ -81,62 +90,83 @@ function getPolishHelpLinks(): { text: string; links: HelpLink[] } {
   }
 }
 
-function getHelpContent(data: { text: string; links: HelpLink[] }): string {
-  let result = data.text
-  data.links.forEach((link, i) => {
-    result = result.replace(`{${i}}`, `<a href="${link.href}" target="_blank" rel="noopener noreferrer">${link.label}</a>`)
-  })
-  return result
+/**
+ * 帮助文案分段（清单 S-01）：文本与链接由模板循环渲染，
+ * 不再拼接 HTML 字符串/使用 v-html；链接点击统一走外链白名单出口。
+ */
+interface HelpSegment {
+  text: string
+  link?: HelpLink
+}
+
+function splitHelp(data: { text: string; links: HelpLink[] }): HelpSegment[] {
+  const segments: HelpSegment[] = []
+  let rest = data.text
+  for (let i = 0; i < data.links.length; i++) {
+    const marker = `{${i}}`
+    const idx = rest.indexOf(marker)
+    if (idx === -1) continue
+    segments.push({ text: rest.slice(0, idx) }, { text: data.links[i].label, link: data.links[i] })
+    rest = rest.slice(idx + marker.length)
+  }
+  if (rest) segments.push({ text: rest })
+  return segments
+}
+
+const asrHelpSegments = computed(() => splitHelp(getAsrHelpLinks()))
+const polishHelpSegments = computed(() => splitHelp(getPolishHelpLinks()))
+
+async function onOpenExternal(href: string) {
+  // 白名单校验 + Tauri opener；非法 URL 静默拒绝（静态常量正常不会走到）
+  await openExternalUrl(href)
 }
 
 function onToggleLogging(v: boolean) {
-  store.apiConfig.loggingEnabled = v
-  store.saveConfig()
-  invoke('set_logging_enabled', { enabled: v }).catch(() => {})
+  store.setLoggingEnabled(v)
 }
 
-function close() { store.isSettingsOpen = false; store.saveConfig() }
+async function close() {
+  // F-06.5.8：关闭前若存在未保存草稿，由 PromptManager 弹三选确认
+  const mgr = promptManagerRef.value
+  if (mgr && !(await mgr.requestClose())) return
+  // P3：关闭前 await 保存队列；失败时保持打开并显示错误与重试入口
+  await store.flush()
+  if (store.saveError) {
+    ui.showToastMessage('有配置未保存成功，请重试', 'error')
+    return
+  }
+  ui.isSettingsOpen = false
+}
 
-const sliceOptions = [
-  { value: '10', label: '10 秒（默认）' },
-  { value: '30', label: '30 秒' },
-  { value: '60', label: '60 秒' },
-  { value: '150', label: '150 秒' },
-]
+// P8：切片选项来自能力文档（capabilities.sliceSeconds），缺失时兜底内置值
+const sliceOptions = computed(() => {
+  const values = caps.caps?.sliceSeconds?.length ? caps.caps.sliceSeconds : [10, 30, 60, 150]
+  return values.map(v => ({ value: String(v), label: v === 10 ? '10 秒（默认）' : `${v} 秒` }))
+})
+
+watch(() => ui.isSettingsOpen, (v) => { if (v) void caps.ensureLoaded() })
 
 const sliceDisabled = computed(() =>
-  store.files.some(f => ['transcribing', 'processing', 'pausing', 'paused'].includes(f.status))
+  files.files.some(f => ['transcribing', 'processing', 'pausing', 'paused'].includes(f.status))
 )
 
 function onSliceSecondsChange(val: string) {
-  store.apiConfig.sliceSeconds = Number(val)
-  store.saveConfig()
+  store.setSliceSeconds(Number(val))
 }
 
 function onAsrProviderChange(v: string) {
-  store.apiConfig.asrProvider = v
-  store.saveConfig()
+  store.setAsrProvider(v)
 }
 
 function onPolishProviderChange(v: string) {
   store.apiConfig.polishProvider = v
-  if (!v.startsWith('custom_')) {
-    const prov = polishProviders.find(p => p.id === v)
-    if (prov && !prov.chat.includes(store.apiConfig.polishModel)) {
-      store.apiConfig.polishModel = prov.chat[0]
-    }
-  } else {
-    const models = store.customPolishModels
-    if (models.length > 0) {
-      store.apiConfig.polishModel = models[0]
-    }
-  }
-  store.saveConfig()
+  // H-03：复用 store 归一逻辑，保证模型属于目标 provider 合法集合
+  const { model } = store.normalizePolish(v, store.apiConfig.polishModel)
+  store.setPolishSelection(v, model)
 }
 
 function onPolishModelChange(v: string) {
-  store.apiConfig.polishModel = v
-  store.saveConfig()
+  store.setPolishSelection(store.apiConfig.polishProvider, v)
 }
 
 function onCustomDelete(customProviderId: string) {
@@ -171,7 +201,6 @@ function onCustomModalSave(provider: CustomProvider) {
   }
   customModalVisible.value = false
   customModalEdit.value = null
-  store.saveConfig()
 }
 
 function onCustomModalClose() {
@@ -179,12 +208,26 @@ function onCustomModalClose() {
   customModalEdit.value = null
 }
 
+// P3：key 输入 trailing debounce；离开输入框立即 flush
+function onAsrKeyInput(e: Event) {
+  store.setProviderKeyInput(store.apiConfig.asrProvider, (e.target as HTMLInputElement).value)
+}
+
+function onPolishKeyInput(e: Event) {
+  store.setProviderKeyInput(store.apiConfig.polishProvider, (e.target as HTMLInputElement).value)
+}
+
 function onAsrKeyChange() {
-  store.saveConfig()
+  store.flushKeyCommit()
 }
 
 function onPolishKeyChange() {
-  store.saveConfig()
+  store.flushKeyCommit()
+}
+
+function onRetry() {
+  store.retryAll()
+  void store.flush()
 }
 
 function onOverlayKeydown(e: KeyboardEvent) {
@@ -194,11 +237,15 @@ function onOverlayKeydown(e: KeyboardEvent) {
 function openLogDir() {
   invoke('open_log_dir').catch(() => {})
 }
+
+function openPromptDir() {
+  invoke('open_prompt_dir').catch(() => {})
+}
 </script>
 
 <template>
   <Transition name="modal">
-    <div v-if="store.isSettingsOpen" class="overlay" @click.self="close" @keydown="onOverlayKeydown" tabindex="-1">
+    <div v-if="ui.isSettingsOpen" class="overlay" @click.self="close" @keydown="onOverlayKeydown" tabindex="-1">
       <div class="panel">
         <div class="panel-header">
           <span class="panel-title">设置</span>
@@ -208,6 +255,11 @@ function openLogDir() {
         </div>
 
         <div class="panel-body">
+          <div v-if="store.saveError" class="save-error">
+            <span class="save-error-text">配置保存失败，请重试</span>
+            <button class="key-toggle" @click="onRetry">重试</button>
+          </div>
+
           <div class="field">
             <label class="label">主题</label>
             <div class="theme-row">
@@ -242,18 +294,24 @@ function openLogDir() {
             <div class="key-row">
               <input
                 :value="store.apiConfig.providerKeys[store.apiConfig.asrProvider] || ''"
-                @input="(e: Event) => { store.apiConfig.providerKeys[store.apiConfig.asrProvider] = (e.target as HTMLInputElement).value }"
+                @input="onAsrKeyInput"
                 :type="showAsrKey ? 'text' : 'password'"
                 class="input"
                 :placeholder="currentAsrProv.prefix + '...'"
                 @change="onAsrKeyChange"
+                @blur="onAsrKeyChange"
               />
               <button class="key-toggle" @click="showAsrKey = !showAsrKey">{{ showAsrKey ? '隐藏' : '显示' }}</button>
             </div>
             <button class="hint-trigger" @click="toggleHelp('asrKey')">这是什么？</button>
             <Transition name="hint-expand">
               <div v-if="showHelp.asrKey" class="hint-box">
-                <p class="hint-text" v-html="getHelpContent(getAsrHelpLinks())"></p>
+                <p class="hint-text">
+                  <template v-for="(seg, i) in asrHelpSegments" :key="i">
+                    <a v-if="seg.link" href="#" class="hint-link" @click.prevent="onOpenExternal(seg.link.href)">{{ seg.text }}</a>
+                    <template v-else>{{ seg.text }}</template>
+                  </template>
+                </p>
               </div>
             </Transition>
           </div>
@@ -294,18 +352,24 @@ function openLogDir() {
               <div class="key-row">
               <input
                 :value="store.apiConfig.providerKeys[store.apiConfig.polishProvider] || ''"
-                @input="(e: Event) => { store.apiConfig.providerKeys[store.apiConfig.polishProvider] = (e.target as HTMLInputElement).value }"
+                @input="onPolishKeyInput"
                 :type="showPolishKey ? 'text' : 'password'"
                 class="input"
                 :placeholder="currentPolishProv.prefix + '...'"
                 @change="onPolishKeyChange"
+                @blur="onPolishKeyChange"
               />
               <button class="key-toggle" @click="showPolishKey = !showPolishKey">{{ showPolishKey ? '隐藏' : '显示' }}</button>
             </div>
             <button class="hint-trigger" @click="toggleHelp('polishKey')">这是什么？</button>
             <Transition name="hint-expand">
               <div v-if="showHelp.polishKey" class="hint-box">
-                <p class="hint-text" v-html="getHelpContent(getPolishHelpLinks())"></p>
+                <p class="hint-text">
+                  <template v-for="(seg, i) in polishHelpSegments" :key="i">
+                    <a v-if="seg.link" href="#" class="hint-link" @click.prevent="onOpenExternal(seg.link.href)">{{ seg.text }}</a>
+                    <template v-else>{{ seg.text }}</template>
+                  </template>
+                </p>
               </div>
             </Transition>
           </div>
@@ -339,13 +403,7 @@ function openLogDir() {
             </div>
           </template>
 
-          <div class="field">
-            <label class="label">AI 规整提示词</label>
-            <textarea v-model="store.apiConfig.polishPrompt" class="textarea" rows="4" placeholder="自定义 AI 规整的提示词..." @change="store.saveConfig()"></textarea>
-            <div class="hint-box">
-              <p class="hint-text">留空使用默认提示词。修改后自动保存。</p>
-            </div>
-          </div>
+          <PromptManager ref="promptManagerRef" />
 
           <div class="field">
             <div class="toggle-row">
@@ -365,7 +423,10 @@ function openLogDir() {
           </div>
 
           <div class="field field-footer">
-            <button class="key-toggle" @click="openLogDir">查看日志</button>
+            <div class="footer-actions">
+              <button class="key-toggle" @click="openLogDir">查看日志</button>
+              <button class="key-toggle" @click="openPromptDir">打开配置目录</button>
+            </div>
             <span class="hint-trigger hint-static">遇到问题？请查看日志信息</span>
           </div>
         </div>
@@ -395,7 +456,7 @@ function openLogDir() {
 }
 
 .panel {
-  width: 570px;
+  width: min(570px, calc(100vw - 32px));
   height: min(660px, 80vh);
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
@@ -462,6 +523,22 @@ function openLogDir() {
   flex: 1;
   overflow-y: auto;
   padding: var(--space-6);
+}
+
+.save-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-4);
+  background: var(--danger-muted);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+}
+.save-error .save-error-text {
+  font-size: 12px;
+  color: var(--danger);
 }
 
 .field {
@@ -663,6 +740,24 @@ function openLogDir() {
   border-top: 1px solid var(--border-default);
 }
 
+.field:has(+ .pm) {
+  margin-bottom: var(--space-6);
+}
+
+.pm {
+  margin-bottom: var(--space-6);
+}
+
+.pm + .field {
+  margin-top: var(--space-2);
+}
+
+.footer-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
 .hint-box {
   margin-top: var(--space-2);
 }
@@ -674,12 +769,15 @@ function openLogDir() {
   margin: 0;
 }
 
-.hint-text :deep(a) {
+.hint-text a,
+.hint-link {
   color: var(--accent);
   text-decoration: none;
+  cursor: pointer;
 }
 
-.hint-text :deep(a:hover) {
+.hint-text a:hover,
+.hint-link:hover {
   text-decoration: underline;
 }
 

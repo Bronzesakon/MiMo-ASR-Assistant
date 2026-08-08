@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { useAppStore } from '../stores/app'
-import { invoke } from '@tauri-apps/api/core'
+import { useFilesStore } from '../stores/files'
+import { useSettingsStore } from '../stores/settings'
+import { useUiStore } from '../stores/ui'
 import { open } from '@tauri-apps/plugin-dialog'
+import { useImportFlow } from '../composables/useImportFlow'
 
-const store = useAppStore()
+const files = useFilesStore()
+const settings = useSettingsStore()
+const ui = useUiStore()
 
-function openSettings() { store.isSettingsOpen = true }
+const importFlow = useImportFlow()
+
+function openSettings() { ui.isSettingsOpen = true }
 
 function fmtDur(s: number) {
   if (!s || s <= 0) return '--:--'
@@ -18,31 +24,21 @@ function fmtDur(s: number) {
 }
 
 async function importAudio() {
-  if (!store.asrKey?.trim()) {
-    store.showToastMessage('请先填写 API Key', 'error')
-    store.isSettingsOpen = true
+  if (!settings.asrKey?.trim()) {
+    ui.showToastMessage('请先填写 API Key', 'error')
+    ui.isSettingsOpen = true
     return
   }
   try {
     const selected = await open({
       multiple: true,
-      filters: [{ name: '音频文件', extensions: ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg'] }]
+      filters: [
+        { name: '音频或视频文件', extensions: ['wav', 'mp3', 'm4a', 'flac', 'ogg', 'mp4', 'mkv', 'avi', 'mov', 'flv', 'ts'] }
+      ]
     })
     if (!selected) return
-    for (const path of (Array.isArray(selected) ? selected : [selected])) {
-      const name = path.split(/[/\\]/).pop() || path
-      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-      let duration = 0
-      try { duration = await invoke<number>('get_audio_duration', { filePath: path }) } catch {}
-      store.addFile({
-        id, name, path, duration, size: 0,
-        status: 'waiting', progress: 0,
-        transcription: '', polished: '',
-        transcriptionWordCount: 0, polishedWordCount: 0,
-        polishStage: 'idle',
-      })
-      store.selectFile(id)
-    }
+    const paths = Array.isArray(selected) ? selected : [selected]
+    await importFlow.importPaths(paths)
   } catch (e) {
     console.error('Import failed:', e)
   }
@@ -56,11 +52,12 @@ async function importAudio() {
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 2v10M3.5 5.5L7 2l3.5 3.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         导入
       </button>
+      <span class="import-hint">可导入音频文件或视频文件（仅提取音轨）</span>
     </div>
     <div class="toolbar-center">
-      <span v-if="store.selectedFile" class="file-badge">
-        {{ store.selectedFile.name }}
-        <span v-if="store.selectedFile.duration > 0" class="dur">{{ fmtDur(store.selectedFile.duration) }}</span>
+      <span v-if="files.selectedFile" class="file-badge">
+        {{ files.selectedFile.name }}
+        <span v-if="files.selectedFile.duration > 0" class="dur">{{ fmtDur(files.selectedFile.duration) }}</span>
       </span>
     </div>
     <div class="toolbar-right">
@@ -90,6 +87,12 @@ async function importAudio() {
   align-items: center;
   gap: var(--space-1);
   min-width: 80px;
+}
+
+.import-hint {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
 }
 
 .toolbar-right {

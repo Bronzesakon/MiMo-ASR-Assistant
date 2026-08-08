@@ -1,0 +1,196 @@
+# 清单 I-01：CI 质量门禁（frontend / rust / security 三 job 并行）
+#
+# 设计约束（按清单 I-01/I-02 原文）：
+# - 权限最小化：顶层 permissions 只读，无任何写权限。
+# - 依赖可重复：npm 一律 `npm ci` + 已提交 package-lock.json；
+#   Cargo 一律 `--locked` + 已提交 Cargo.lock，禁止 CI 静默解析到不同依赖。
+# - 缓存范围仅限 npm 下载缓存与 Cargo registry/git/target；
+#   缓存 key 含锁文件 hash（setup-node cache 与 rust-cache 均自动满足）。
+#   不缓存、不上传任何配置文件、API Key、用户音频、日志、临时转写文本。
+# - CI 不运行需要真实 API Key 的在线转写；端到端真实服务冒烟保留为
+#   发布前人工步骤（见 README「发布检查清单」）。
+# - ffmpeg.exe 已入库（resources/ffmpeg.exe + .sha256），build.rs 的
+#   SHA-256 门禁在 cargo check/test/clippy 编译期强制执行；rust job
+#   另设显式哈希比对步骤，使门禁失败时日志更直观。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  # C-04：手动触发的发布包门禁（构建 NSIS 安装包并校验产物）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支/PR 有新提交时取消旧运行，节省 runner
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: frontend (typecheck / lint / vitest / build)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 固定受支持的 Node 主版本（与 README 前置依赖声明一致）
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm # 缓存 key 自动包含 package-lock.json hash
+
+      - name: Install dependencies (npm ci, 锁文件一致)
+        run: npm ci
+
+      - name: Typecheck (vue-tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Lint (ESLint, 0 warning 门禁)
+        run: npm run lint
+
+      - name: Unit tests (vitest)
+        run: npm run test
+
+      - name: "Build (node scripts/build.mjs: typecheck + vite build)"
+        run: npm run build
+
+      - name: Version sync check (package.json / tauri.conf.json / Cargo.toml)
+        run: npm run version:check
+
+  rust:
+    name: rust (check / test / clippy, Windows runner)
+    runs-on: windows-latest
+    # DPAPI 相关测试依赖 Windows，故 Rust job 固定在 Windows runner
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Rust 工具链由仓库根 rust-toolchain.toml 决定（channel + clippy），
+      # GitHub runner 自带 rustup，自动按该文件安装；无需额外 action。
+      - name: Cache Cargo (registry / git / target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # rust-cache 的缓存 key 自动包含 Cargo.lock hash
+
+      # 显式验证捆绑 ffmpeg.exe 与 sha256 基准一致（build.rs 编译期门禁的
+      # 等价前置检查；哈希不匹配时此处先给出直观错误）
+      - name: Verify bundled ffmpeg.exe SHA-256 baseline
+        shell: pwsh
+        working-directory: .
+        run: |
+          $expected = (Select-String -Path src-tauri/resources/ffmpeg.exe.sha256 -Pattern '[0-9a-fA-F]{64}').Matches[0].Value.ToUpper()
+          $actual = (Get-FileHash src-tauri/resources/ffmpeg.exe -Algorithm SHA256).Hash.ToUpper()
+          if ($actual -ne $expected) {
+            throw "ffmpeg.exe SHA-256 mismatch: expected $expected, actual $actual"
+          }
+          Write-Host "ffmpeg.exe integrity baseline OK: $actual"
+
+      - name: cargo check --locked
+        run: cargo check --locked
+
+      - name: cargo test --locked
+        run: cargo test --locked
+
+      - name: cargo clippy --locked (0 warning 门禁)
+        run: cargo clippy --locked -- -D warnings
+
+  # C-04：手动触发发布包门禁。仅 workflow_dispatch；构建 NSIS 并校验产物。
+  package:
+    name: package (tauri build / NSIS)
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Rust 工具链由仓库根 rust-toolchain.toml 决定；GitHub runner 自带 rustup
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies (npm ci, 锁文件一致)
+        run: npm ci
+
+      - name: Lint (ESLint, 0 warning 门禁)
+        run: npm run lint
+
+      - name: Unit tests (vitest)
+        run: npm run test
+
+      # 发布门禁：MIMO_FFMPEG_REQUIRE=1 使 build.rs 在 ffmpeg.exe 缺失时硬失败
+      - name: Tauri build (release, NSIS, ffmpeg required)
+        env:
+          MIMO_FFMPEG_REQUIRE: "1"
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Verify packaged resources (ffmpeg exe + sha256 + WebView2Loader)
+        shell: pwsh
+        run: |
+          $nsis = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $nsis) { throw "NSIS installer not produced" }
+          Write-Host "NSIS: $($nsis.FullName)"
+          # 隔离安装目录运行校验：不依赖 checkout 绝对路径
+          $installDir = Join-Path $env:RUNNER_TEMP "mimo_install_check"
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          $proc = Start-Process -FilePath $nsis.FullName -ArgumentList "/S", "/D=$installDir" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Installer silent run failed: $($proc.ExitCode)" }
+          $exe = Join-Path $installDir "resources\ffmpeg.exe"
+          $sha = Join-Path $installDir "resources\ffmpeg.exe.sha256"
+          $wv2 = Join-Path $installDir "WebView2Loader.dll"
+          if (-not (Test-Path $exe)) { throw "ffmpeg.exe missing in installed package" }
+          if (-not (Test-Path $sha)) { throw "ffmpeg.exe.sha256 missing in installed package" }
+          if (-not (Test-Path $wv2)) { throw "WebView2Loader.dll missing in installed package" }
+          $expected = (Select-String -Path src-tauri/resources/ffmpeg.exe.sha256 -Pattern '[0-9a-fA-F]{64}').Matches[0].Value.ToUpper()
+          $installed = (Get-FileHash $exe -Algorithm SHA256).Hash.ToUpper()
+          if ($installed -ne $expected) { throw "installed ffmpeg.exe hash mismatch" }
+          Write-Host "Package integrity OK, ffmpeg SHA-256 = $installed"
+
+  security:
+    name: security (npm audit / cargo audit)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # 容忍策略（清单 I-02）：生产依赖 high/critical 阻断；
+      # moderate/low 可暂缓但必须在 SECURITY.md 记录 advisory 与复查日期
+      - name: npm audit (omit=dev, high 及以上阻断)
+        run: npm audit --omit=dev --audit-level=high
+
+      # RustSec 审计：cargo-audit 安装版本固定，避免供应链漂移
+      - name: Install cargo-audit (pinned version)
+        run: cargo install cargo-audit --version 0.21.2 --locked
+
+      - name: cargo audit --deny warnings
+        working-directory: src-tauri
+        run: cargo audit --deny warnings

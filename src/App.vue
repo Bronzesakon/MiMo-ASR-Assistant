@@ -1,6 +1,11 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
-import { useAppStore } from './stores/app'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { useSettingsStore } from './stores/settings'
+import { useFilesStore } from './stores/files'
+import { useUiStore } from './stores/ui'
+import { usePromptsStore } from './stores/prompts'
+import { useCapabilitiesStore } from './stores/capabilities'
+import { setupListeners, teardownListeners } from './utils/events'
 import TitleBar from './components/TitleBar.vue'
 import Toolbar from './components/Toolbar.vue'
 import FileList from './components/FileList.vue'
@@ -9,16 +14,45 @@ import StatusBar from './components/StatusBar.vue'
 import SettingsDrawer from './components/SettingsDrawer.vue'
 import Toast from './components/Toast.vue'
 
-const store = useAppStore()
+const settings = useSettingsStore()
 
-onMounted(async () => {
+// P2-02：监听注册全有或全无。failed 时显示重试按钮，重试前先 teardown。
+const initializationState = ref<'starting' | 'ready' | 'failed'>('starting')
+
+async function init() {
+  initializationState.value = 'starting'
+  try {
+    // 后端事件监听在应用层显式注册（store 构造无副作用，清单 F-03）。
+    // H-01：先 await 全部监听注册完成，再加载配置/提示词，避免一次性恢复提示丢失。
+    await setupListeners(useFilesStore(), useUiStore())
+    // 配置加载与 splash 最短显示时间并行；提示词文档启动时预加载（F-06.4.4）
+    await Promise.all([
+      settings.loadConfig().catch(e => console.error('loadConfig failed:', e)),
+      usePromptsStore().ensureLoaded().catch(e => console.error('loadPrompts failed:', e)),
+      useCapabilitiesStore().ensureLoaded().catch(e => console.error('loadCapabilities failed:', e)),
+      new Promise(resolve => setTimeout(resolve, 1200)),
+    ])
+    initializationState.value = 'ready'
+    window.__hideSplash?.()
+  } catch (e) {
+    console.error('[事件监听] 注册失败:', e)
+    teardownListeners()
+    initializationState.value = 'failed'
+  }
+}
+
+function retry() {
+  teardownListeners()
+  void init()
+}
+
+onMounted(() => {
   document.addEventListener('contextmenu', e => e.preventDefault())
-  // 配置加载与 splash 最短显示时间并行
-  await Promise.all([
-    store.loadConfig().catch(e => console.error('loadConfig failed:', e)),
-    new Promise(resolve => setTimeout(resolve, 1200)),
-  ])
-  ;(window as any).__hideSplash?.()
+  void init()
+})
+
+onUnmounted(() => {
+  teardownListeners()
 })
 </script>
 
@@ -33,6 +67,14 @@ onMounted(async () => {
     <StatusBar />
     <SettingsDrawer />
     <Toast />
+
+    <!-- P2-02：监听注册失败时显示重试 -->
+    <div v-if="initializationState === 'failed'" class="init-failed">
+      <div class="init-failed-box">
+        <p>事件监听初始化失败，功能可能不可用。</p>
+        <button @click="retry">重试</button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -193,4 +235,41 @@ body {
 .app {
   animation: app-fade-in 0.35s var(--ease-out) both;
 }
+
+/* P2-02：初始化失败重试层 */
+.init-failed {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg-base) 80%, transparent);
+  backdrop-filter: blur(4px);
+}
+.init-failed-box {
+  padding: var(--space-6);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.init-failed-box button {
+  height: 30px;
+  padding: 0 var(--space-5);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+.init-failed-box button:hover { background: var(--accent-muted); }
 </style>

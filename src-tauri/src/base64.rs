@@ -1,49 +1,85 @@
-/// 共享 Base64 编码/解码（audio 和 dpapi 模块共用）
+//! 共享 Base64 编码/解码（audio 和 dpapi 模块共用）。
+//!
+//! B-10：用 `base64 = "0.22"` crate 的 STANDARD 引擎替换自研逐字节实现，
+//! 消除 9MB 分片约 33% 的额外编码耗时；公开函数签名保持不变。
+//! 解码仍容忍空白字符（dpapi 持久化串可能带换行），空串返回空向量。
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+
+/// 标准 Base64 编码（带填充）
 pub fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 { result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(CHARS[(triple & 0x3F) as usize] as char); } else { result.push('='); }
-    }
-    result
+    STANDARD.encode(data)
 }
 
+/// 编码后长度（含填充），与 STANDARD 引擎输出一致
 pub fn base64_encoded_len(input_len: usize) -> usize {
-    (input_len + 2) / 3 * 4
+    input_len.div_ceil(3) * 4
 }
 
+/// 标准 Base64 解码：先过滤空白字符（兼容旧实现的宽松行为），
+/// 非法字符/错误填充由 crate 严格拒绝。
 pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let input: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    if input.is_empty() { return Ok(vec![]); }
-    if input.len() % 4 != 0 { return Err("Invalid base64 length".to_string()); }
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return Ok(vec![]);
+    }
+    STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|e| format!("Invalid base64: {}", e))
+}
 
-    fn char_val(c: char) -> Result<u8, String> {
-        match c {
-            'A'..='Z' => Ok((c as u8) - b'A'),
-            'a'..='z' => Ok((c as u8) - b'a' + 26),
-            '0'..='9' => Ok((c as u8) - b'0' + 52),
-            '+' => Ok(62),
-            '/' => Ok(63),
-            _ => Err(format!("Invalid base64 char: {}", c)),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // —— 原寄居在 audio/mod.rs 的测试（B-10 迁移至此）——
+
+    #[test]
+    fn test_base64_encode() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
     }
 
-    let mut result = Vec::with_capacity(input.len() * 3 / 4);
-    for chunk in input.as_bytes().chunks(4) {
-        let a = char_val(chunk[0] as char)?;
-        let b = char_val(chunk[1] as char)?;
-        let c = if chunk[2] == b'=' { 0 } else { char_val(chunk[2] as char)? };
-        let d = if chunk[3] == b'=' { 0 } else { char_val(chunk[3] as char)? };
-        result.push((a << 2) | (b >> 4));
-        if chunk[2] != b'=' { result.push((b << 4) | (c >> 2)); }
-        if chunk[3] != b'=' { result.push((c << 6) | d); }
+    #[test]
+    fn test_base64_encoded_len() {
+        assert_eq!(base64_encoded_len(0), 0);
+        assert_eq!(base64_encoded_len(1), 4);
+        assert_eq!(base64_encoded_len(2), 4);
+        assert_eq!(base64_encoded_len(3), 4);
+        assert_eq!(base64_encoded_len(4), 8);
     }
-    Ok(result)
+
+    // —— 新增：替换 crate 后的行为回归 ——
+
+    #[test]
+    fn roundtrip_binary_data() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let encoded = base64_encode(&data);
+        assert_eq!(encoded.len(), base64_encoded_len(data.len()));
+        assert_eq!(base64_decode(&encoded).expect("合法编码应可解码"), data);
+    }
+
+    #[test]
+    fn decode_tolerates_whitespace() {
+        // dpapi 持久化兼容：空白字符被过滤后正常解码
+        assert_eq!(
+            base64_decode("Zm9v\n YmFy ").expect("空白应被容忍"),
+            b"foobar"
+        );
+    }
+
+    #[test]
+    fn decode_empty_returns_empty() {
+        assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
+        assert_eq!(base64_decode("  \n").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_input() {
+        assert!(base64_decode("!!!").is_err());
+        assert!(base64_decode("Zg=").is_err()); // 长度非 4 倍数
+    }
 }

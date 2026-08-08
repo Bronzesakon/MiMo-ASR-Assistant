@@ -1,989 +1,152 @@
-mod ffmpeg;
-mod audio;
+//! 应用入口（清单 B-11 重组）：本文件只保留 run()、builder、插件注册与
+//! managed state。IPC 命令见 commands/，配置见 config.rs，提示词仓库见
+//! prompt_store.rs，托盘与窗口见 tray.rs，魔法常量见 constants.rs。
+
+// 清单 I-03 平台策略 A：运行与发布仅支持 Windows 10/11 x64。
+// 非 Windows 构建在编译期给出明确的平台不支持错误，避免在链接阶段
+// 以找不到 crypt32 等晦涩错误失败。平台支持矩阵见 README「平台支持」。
+#[cfg(not(target_os = "windows"))]
+compile_error!(
+    "MiMo ASR Assistant 仅支持 Windows 平台（Windows 10/11 x64，平台策略 A）：\
+     API Key 加密依赖 Windows DPAPI，音频转码依赖捆绑的精简 ffmpeg.exe。\
+     非 Windows 平台不受支持，详见 README「平台支持」章节。"
+);
+
 mod api;
-mod prompt;
-mod provider;
-mod log;
-mod dpapi;
-mod rate_limiter;
+mod atomic;
+mod audio;
 mod base64;
-
-use api::Emitter;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{
-    AppHandle, Emitter as TauriEmitterTrait, Manager, Theme, WebviewUrl, WebviewWindow,
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    webview::PageLoadEvent,
-    window::Color,
-};
-
-// ============================================================
-// Tauri 事件发射器
-// ============================================================
-
-struct TauriEmitter {
-    handle: AppHandle,
-}
-
-impl api::Emitter for TauriEmitter {
-    fn emit(&self, event: &str, payload: &str) -> Result<(), String> {
-        self.handle.emit(event, payload).map_err(|e| e.to_string())
-    }
-}
-
-/// 带 file_id 标签的事件发射器，所有 emit 自动携带 file_id
-struct TaggedEmitter {
-    handle: AppHandle,
-    file_id: String,
-}
-
-impl api::Emitter for TaggedEmitter {
-    fn emit(&self, event: &str, payload: &str) -> Result<(), String> {
-        let tagged = serde_json::json!({ "file_id": self.file_id, "text": payload });
-        self.handle.emit(event, &tagged.to_string()).map_err(|e| e.to_string())
-    }
-}
-
-// ============================================================
-// 任务取消机制
-// ============================================================
-
-struct CancelHandle {
-    cancelled: Arc<AtomicBool>,
-    pause_flag: Arc<AtomicBool>,
-}
-
-struct TaskRegistry {
-    tasks: tokio::sync::Mutex<HashMap<String, CancelHandle>>,
-}
-
-#[tauri::command]
-async fn cancel_task(handle: AppHandle, file_id: String, file_name: String) {
-    let handle_opt = handle.state::<TaskRegistry>().tasks.lock().await.remove(&file_id);
-    if let Some(ch) = handle_opt {
-        ch.cancelled.store(true, Ordering::Release);
-        info!("[{}] 任务已取消", file_name);
-    }
-}
-
-#[tauri::command]
-async fn pause_task(handle: AppHandle, file_id: String, file_name: String) {
-    let registry = handle.state::<TaskRegistry>();
-    let tasks = registry.tasks.lock().await;
-    if let Some(ch) = tasks.get(&file_id) {
-        ch.pause_flag.store(true, Ordering::Release);
-        info!("[{}] 暂停请求已发送", file_name);
-    }
-}
-
-#[tauri::command]
-fn cleanup_file_temp(temp_dir: String) {
-    audio::cleanup_temp(std::path::Path::new(&temp_dir));
-}
-
-/// 从暂停处继续转写：读取 temp 目录中的已有切片文件，从指定索引开始调用 API
-#[tauri::command]
-async fn resume_transcription(
-    handle: AppHandle,
-    file_id: String,
-    file_name: String,
-    temp_dir: String,
-    start_index: u32,
-    api_params: ApiParams,
-) -> Result<(), String> {
-    let temp_path = std::path::PathBuf::from(&temp_dir);
-    if !temp_path.exists() {
-        return Err("临时目录不存在，请重新转写".to_string());
-    }
-
-    let config: api::ApiConfig = api_params.into();
-    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
-    let plain_emitter = TauriEmitter { handle: handle.clone() };
-    let limiter = handle.state::<rate_limiter::AsrRateLimiter>();
-
-    // 注册取消和暂停句柄
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let pause_flag = Arc::new(AtomicBool::new(false));
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle {
-            cancelled: cancelled.clone(),
-            pause_flag: pause_flag.clone(),
-        });
-    }
-
-    // 扫描 temp 目录中的切片文件
-    let slice_files = audio::collect_slice_files(&temp_path);
-    let total = slice_files.len() as u32;
-    if total == 0 {
-        return Err("未找到切片文件，请重新转写".to_string());
-    }
-
-    info!("[{}] resume_transcription 开始: {} 个切片, 从分片 {} 继续", file_name, total, start_index);
-
-    let start_time = std::time::Instant::now();
-
-    // 从 start_index 开始遍历（start_index 是 1-based）
-    for (i, (_start_sec, slice_path)) in slice_files.iter().enumerate() {
-        let index = (i as u32) + 1; // 1-based
-        if index < start_index {
-            continue;
-        }
-
-        // 取消检查
-        if cancelled.load(Ordering::Acquire) {
-            let registry = handle.state::<TaskRegistry>();
-            registry.tasks.lock().await.remove(&file_id);
-            audio::cleanup_temp(&temp_path);
-            info!("[{}] resume_transcription 已取消", file_name);
-            return Ok(());
-        }
-
-        // 发射分片进度
-        let progress_json = serde_json::json!({
-            "file_id": file_id, "current": index, "total": total,
-        });
-        let _ = plain_emitter.emit("transcription-progress", &progress_json.to_string());
-
-        // 编码切片为 data URL
-        let data_url = audio::encode_slice_to_data_url(slice_path)
-            .map_err(|e| format!("切片编码失败: {}", e))?;
-
-        // 获取速率许可
-        let _permit = limiter.0.acquire_permit().await;
-
-        let slice_start = std::time::Instant::now();
-
-        match api::transcribe_with_retry(&data_url, &config, &tagged_emitter, &cancelled).await {
-            Ok(()) => {}
-            Err(e) => {
-                error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
-                let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-                let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-                let registry = handle.state::<TaskRegistry>();
-                registry.tasks.lock().await.remove(&file_id);
-                return Err(e.to_string());
-            }
-        }
-
-        // 发射状态更新
-        let slice_ms = slice_start.elapsed().as_millis();
-        let elapsed_s = start_time.elapsed().as_secs_f64();
-        let upload_speed = if slice_ms > 0 { (data_url.len() as f64 / slice_ms as f64) * 1000.0 } else { 0.0 };
-        let status_json = serde_json::json!({
-            "file_id": file_id, "slice": index, "total": total,
-            "elapsed": elapsed_s, "upload_speed": upload_speed,
-        });
-        let _ = plain_emitter.emit("status-update", &status_json.to_string());
-
-        // 暂停检查
-        if pause_flag.load(Ordering::Acquire) {
-            let actual_total = audio::count_slice_files(&temp_path);
-            let paused_json = serde_json::json!({
-                "file_id": file_id, "last_completed": index, "total": actual_total,
-                "temp_dir": temp_path.to_string_lossy(),
-            });
-            let _ = plain_emitter.emit("transcription-paused", &paused_json.to_string());
-            let registry = handle.state::<TaskRegistry>();
-            registry.tasks.lock().await.remove(&file_id);
-            info!("[{}] resume_transcription 已暂停 (分片 {}/{})", file_name, index, actual_total);
-            return Ok(());
-        }
-    }
-
-    // 全部完成
-    let registry = handle.state::<TaskRegistry>();
-    registry.tasks.lock().await.remove(&file_id);
-    audio::cleanup_temp(&temp_path);
-
-    let complete_json = serde_json::json!({ "file_id": file_id });
-    let _ = plain_emitter.emit("transcription-complete", &complete_json.to_string());
-    info!("[{}] resume_transcription 完成", file_name);
-    Ok(())
-}
-
-// ============================================================
-// 请求参数类型
-// ============================================================
-
-#[derive(Debug, Deserialize)]
-pub struct ApiParams {
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub language: Option<String>,
-}
-
-impl From<ApiParams> for api::ApiConfig {
-    fn from(params: ApiParams) -> Self {
-        api::ApiConfig {
-            base_url: params.base_url,
-            api_key: params.api_key,
-            model: params.model,
-            language: params.language,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ProviderInfo {
-    pub id: String,
-    pub name: String,
-    pub base_url: String,
-    pub key_prefix: String,
-    pub asr_models: Vec<String>,
-    pub chat_models: Vec<String>,
-}
-
-impl From<provider::ProviderInfo> for ProviderInfo {
-    fn from(info: provider::ProviderInfo) -> Self {
-        ProviderInfo {
-            id: info.id,
-            name: info.name,
-            base_url: info.base_url,
-            key_prefix: info.key_prefix,
-            asr_models: info.asr_models,
-            chat_models: info.chat_models,
-        }
-    }
-}
-
-// ============================================================
-// 配置文件
-// ============================================================
+mod cancel;
+mod commands;
+mod config;
+mod config_store;
+mod constants;
+mod dpapi;
+mod endpoint;
+mod ffmpeg_exe;
+mod log;
+mod prompt;
+mod prompt_store;
+mod provider;
+mod rate_limiter;
+mod state;
+#[cfg(test)]
+mod task;
+mod tray;
+mod wav_codec;
 
 use std::collections::HashMap;
+use tauri::Manager;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CustomProvider {
-    pub id: String,
-    pub name: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub models: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AppConfig {
-    pub provider: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub transcription_model: String,
-    pub polish_model: String,
-    pub theme: String,
-    #[serde(default = "default_polish_prompt")]
-    pub polish_prompt: String,
-    #[serde(default)]
-    pub provider_keys: HashMap<String, String>,
-    #[serde(default = "default_true")]
-    pub logging_enabled: bool,
-    #[serde(default = "default_asr_provider")]
-    pub asr_provider: String,
-    #[serde(default = "default_polish_provider")]
-    pub polish_provider: String,
-    #[serde(default = "default_slice_seconds")]
-    pub slice_seconds: u32,
-    #[serde(default)]
-    pub custom_providers: Vec<CustomProvider>,
-}
-
-fn default_true() -> bool { true }
-
-fn default_asr_provider() -> String { "mimo-api".to_string() }
-
-fn default_polish_provider() -> String { "deepseek".to_string() }
-
-fn default_slice_seconds() -> u32 { 10 }
-
-fn default_polish_prompt() -> String {
-    "给你以下语音转写结果，理解内容，根据相关领域的正确内容和相关术语、知识，联系上下文勘误部分转文字错误，优化每句话的口语化表达的语气词、重复字等，要求只做修饰，每句话都要输出，不可简略，不可概括，根据原文的内容，智能切分长段落".to_string()
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            provider: "mimo-api".to_string(),
-            base_url: "https://api.xiaomimimo.com/v1".to_string(),
-            api_key: String::new(),
-            transcription_model: "mimo-v2.5-asr".to_string(),
-            polish_model: "mimo-v2.5".to_string(),
-            theme: "system".to_string(),
-            polish_prompt: default_polish_prompt(),
-            provider_keys: HashMap::new(),
-            logging_enabled: true,
-            asr_provider: "mimo-api".to_string(),
-            polish_provider: "deepseek".to_string(),
-            slice_seconds: 10,
-            custom_providers: Vec::new(),
-        }
-    }
-}
-
-fn config_path() -> PathBuf {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join("config.json")
-}
-
-#[tauri::command]
-fn load_config() -> AppConfig {
-    let path = config_path();
-    let config = if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let mut config: AppConfig = match serde_json::from_str(&content) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("config.json 解析失败: {}，使用默认配置", e);
-                        let bak = path.with_extension("json.bak");
-                        let _ = std::fs::write(&bak, &content);
-                        AppConfig::default()
-                    }
-                };
-                // 迁移旧配置：无 asr_provider 时从旧 provider 推导
-                if config.asr_provider.is_empty() {
-                    config.asr_provider = if config.provider == "deepseek" {
-                        "mimo-api".to_string()
-                    } else {
-                        config.provider.clone()
-                    };
-                }
-                if config.polish_provider.is_empty() {
-                    config.polish_provider = config.provider.clone();
-                }
-                if config.api_key.starts_with("ENC:") {
-                    match dpapi::decrypt_string(&config.api_key[4..]) {
-                        Ok(decrypted) => config.api_key = decrypted,
-                        Err(e) => {
-                            error!("API Key 解密失败: {}", e);
-                            config.api_key.clear();
-                        }
-                    }
-                }
-                // 解密 provider_keys
-                for (_, value) in config.provider_keys.iter_mut() {
-                    if value.starts_with("ENC:") {
-                        match dpapi::decrypt_string(&value[4..]) {
-                            Ok(decrypted) => *value = decrypted,
-                            Err(e) => {
-                                error!("Provider Key 解密失败: {}", e);
-                                value.clear();
-                            }
-                        }
-                    }
-                }
-                // 解密 custom_providers 的 api_key
-                for cp in config.custom_providers.iter_mut() {
-                    if cp.api_key.starts_with("ENC:") {
-                        match dpapi::decrypt_string(&cp.api_key[4..]) {
-                            Ok(decrypted) => cp.api_key = decrypted,
-                            Err(e) => {
-                                error!("[{}] 自定义服务商 Key 解密失败: {}", cp.name, e);
-                                cp.api_key.clear();
-                            }
-                        }
-                    }
-                }
-                config
-            }
-            Err(_) => AppConfig::default(),
-        }
-    } else {
-        AppConfig::default()
-    };
-    log::set_enabled(config.logging_enabled);
-    config
-}
-
-#[tauri::command]
-fn save_config(config: AppConfig) -> Result<(), String> {
-    let path = config_path();
-    let mut save = config.clone();
-    // 向后兼容：同步 api_key 为当前活跃 provider 的 key
-    if save.api_key.is_empty() {
-        let active_key = save.provider_keys.get(&save.asr_provider)
-            .or_else(|| save.provider_keys.get(&save.polish_provider))
-            .cloned()
-            .unwrap_or_default();
-        save.api_key = active_key;
-    }
-    if !save.api_key.is_empty() {
-        let encrypted = dpapi::encrypt_string(&save.api_key).map_err(|e| e.to_string())?;
-        save.api_key = format!("ENC:{}", encrypted);
-    }
-    // 加密 provider_keys
-    for (_, value) in save.provider_keys.iter_mut() {
-        if !value.is_empty() {
-            let encrypted = dpapi::encrypt_string(value).map_err(|e| e.to_string())?;
-            *value = format!("ENC:{}", encrypted);
-        }
-    }
-    // 加密 custom_providers 的 api_key
-    for cp in save.custom_providers.iter_mut() {
-        if !cp.api_key.is_empty() {
-            let encrypted = dpapi::encrypt_string(&cp.api_key).map_err(|e| e.to_string())?;
-            cp.api_key = format!("ENC:{}", encrypted);
-        }
-    }
-    let json = serde_json::to_string_pretty(&save).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    log::set_enabled(config.logging_enabled);
-    Ok(())
-}
-
-#[tauri::command]
-fn set_logging_enabled(enabled: bool) {
-    log::set_enabled(enabled);
-}
-
-// ============================================================
-// Tauri 命令
-// ============================================================
-
-/// 获取音频时长
-#[tauri::command]
-fn get_audio_duration(file_path: String) -> Result<f64, String> {
-    let path = PathBuf::from(&file_path);
-    ffmpeg::get_duration(&path).map_err(|e| e.to_string())
-}
-
-/// 处理音频并逐片转写（合并 process_audio + start_transcription）
-/// 每个分片切完立即发送 API 并 drop，不全部存内存
-#[tauri::command]
-async fn process_and_transcribe(
-    handle: AppHandle,
-    file_id: String,
-    file_path: String,
-    api_params: ApiParams,
-) -> Result<(), String> {
-    let path = PathBuf::from(&file_path);
-    let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| file_id.clone());
-    info!("[{}] process_and_transcribe 开始", file_name);
-
-    let config: api::ApiConfig = api_params.into();
-    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
-    let plain_emitter = TauriEmitter { handle: handle.clone() };
-    let limiter = handle.state::<rate_limiter::AsrRateLimiter>();
-
-    // 注册取消和暂停句柄
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let pause_flag = Arc::new(AtomicBool::new(false));
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle {
-            cancelled: cancelled.clone(),
-            pause_flag: pause_flag.clone(),
-        });
-    }
-
-    if !path.exists() {
-        let err_msg = format!("文件不存在: {}", file_path);
-        let _ = plain_emitter.emit("transcription-error", &serde_json::json!({
-            "file_id": file_id, "error": err_msg
-        }).to_string());
-        return Err(err_msg);
-    }
-
-    // 发射"转码中"状态
-    let _ = plain_emitter.emit("process-status", &serde_json::json!({
-        "file_id": file_id, "stage": "转码中"
-    }).to_string());
-
-    // channel：blocking task → async context，缓冲 8 个分片
-    let (tx, rx) = tokio::sync::mpsc::channel::<(u32, u32, String)>(4);
-    let mut rx = Some(rx);
-
-    // 临时目录由本函数管理，确保取消时也能清理
-    let temp_dir = audio::unique_temp_dir();
-
-    // 从配置读取切片时长
-    let slice_sec = load_config().slice_seconds;
-
-    // 在阻塞线程中执行切片，每切完一片通过 channel 发送
-    let slice_temp_dir = temp_dir.clone();
-    let blocking_task = tokio::task::spawn_blocking(move || {
-        audio::convert_and_slice(&path, &slice_temp_dir, Some(slice_sec), &|index, total, data_url| {
-            let _ = tx.blocking_send((index, total, data_url));
-        })
-    });
-
-    // 发射"分片中"状态
-    let _ = plain_emitter.emit("process-status", &serde_json::json!({
-        "file_id": file_id, "stage": "分片中"
-    }).to_string());
-
-    // 逐片接收并立即发送 API
-    while let Some((index, total, data_url)) = rx.as_mut().unwrap().recv().await {
-        // 检查是否已取消
-        if cancelled.load(Ordering::Acquire) {
-            // 立即关闭 channel，通知 blocking task 停止切片
-            rx.take();
-            break;
-        }
-
-        // 发射分片进度
-        let progress_json = serde_json::json!({
-            "file_id": file_id, "current": index, "total": total,
-        });
-        let _ = plain_emitter.emit("transcription-progress", &progress_json.to_string());
-
-        // 获取速率许可
-        let _rate_permit = limiter.0.acquire_permit().await;
-
-        match api::transcribe_with_retry(&data_url, &config, &tagged_emitter, &cancelled).await {
-            Ok(()) => {}
-            Err(e) => {
-                error!("[{}] 片段 {} 最终失败: {}", file_id, index, e);
-                let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-                let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-                return Err(e.to_string());
-            }
-        }
-        // data_url 在此 drop，释放 ~9MB 内存
-
-        // 分片成功后检查暂停
-        if pause_flag.load(Ordering::Acquire) {
-            // 关闭 channel，blocking task 后续 blocking_send 失败，但会继续把剩余分片切完写入 temp
-            rx.take();
-            // 等待 blocking task 完成（确保 temp 目录中所有切片都写完）
-            let _ = blocking_task.await;
-            // 扫描 temp 目录获取实际切片总数
-            let actual_total = audio::count_slice_files(&temp_dir);
-            // 发射暂停事件
-            let paused_json = serde_json::json!({
-                "file_id": file_id, "last_completed": index, "total": actual_total,
-                "temp_dir": temp_dir.to_string_lossy(),
-            });
-            let _ = plain_emitter.emit("transcription-paused", &paused_json.to_string());
-            // 从 TaskRegistry 移除但不清理 temp
-            let registry = handle.state::<TaskRegistry>();
-            registry.tasks.lock().await.remove(&file_id);
-            info!("[{}] 已暂停 (分片 {}/{})", file_name, index, actual_total);
-            return Ok(());
-        }
-    }
-
-    // 等待 blocking task 完成
-    let _ = blocking_task.await;
-
-    // 清理取消句柄
-    let is_cancelled = cancelled.load(Ordering::Acquire);
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.remove(&file_id);
-    }
-
-    if is_cancelled {
-        audio::cleanup_temp(&temp_dir);
-        info!("[{}] process_and_transcribe 已取消", file_name);
-        return Ok(());
-    }
-
-    let complete_json = serde_json::json!({ "file_id": file_id });
-    let _ = plain_emitter.emit("transcription-complete", &complete_json.to_string());
-
-    // 转写完成，清理临时目录
-    audio::cleanup_temp(&temp_dir);
-
-    info!("[{}] process_and_transcribe 完成", file_name);
-    Ok(())
-}
-
-/// 流式聊天文本（携带 file_id 做事件隔离，含日志）
-#[tauri::command]
-async fn start_chat(
-    handle: AppHandle,
-    file_id: String,
-    system_prompt: String,
-    user_text: String,
-    audio_data_url: Option<String>,
-    api_params: ApiParams,
-    response_format: Option<String>,
-    file_name: String,
-) -> Result<(), String> {
-    info!("[{}] start_chat 开始: 模型={}, 文本长度={}", file_name, api_params.model, user_text.len());
-
-    let config: api::ApiConfig = api_params.into();
-    let plain_emitter = TauriEmitter { handle: handle.clone() };
-    let limiter = handle.state::<rate_limiter::ChatRateLimiter>();
-
-    // 注册取消和暂停句柄
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let pause_flag = Arc::new(AtomicBool::new(false));
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.insert(file_id.clone(), CancelHandle {
-            cancelled: cancelled.clone(),
-            pause_flag: pause_flag.clone(),
-        });
-    }
-
-    // 获取 Chat 速率许可（等待并发槽位 + RPM 余量）
-    let _permit = limiter.0.acquire_permit().await;
-
-    // 使用 build_prompt 构造系统提示词（模板扩展：system + prefix + suffix）
-    let template = prompt::PromptTemplate {
-        system: system_prompt,
-        user_prefix: String::new(),
-        user_suffix: String::new(),
-    };
-    let final_system_prompt = prompt::build_prompt(&template, "");
-
-    let tagged_emitter = TaggedEmitter { handle: handle.clone(), file_id: file_id.clone() };
-
-    match api::chat_with_retry(
-        &final_system_prompt, &user_text, audio_data_url.as_deref(),
-        &config, response_format.as_deref(), &tagged_emitter, &cancelled,
-    ).await {
-        Ok(()) => {}
-        Err(e) => {
-            let registry = handle.state::<TaskRegistry>();
-            registry.tasks.lock().await.remove(&file_id);
-            error!("[{}] start_chat 最终失败: {} (模型={}, 文本长度={})", file_id, e, config.model, user_text.len());
-            let err_json = serde_json::json!({ "file_id": file_id, "error": e.to_string() });
-            let _ = plain_emitter.emit("transcription-error", &err_json.to_string());
-            return Err(e.to_string());
-        }
-    }
-
-    // 清理取消句柄
-    {
-        let registry = handle.state::<TaskRegistry>();
-        registry.tasks.lock().await.remove(&file_id);
-    }
-
-    if cancelled.load(Ordering::Acquire) {
-        info!("[{}] start_chat 已取消", file_name);
-        return Ok(());
-    }
-
-    let complete_json = serde_json::json!({ "file_id": file_id });
-    let _ = plain_emitter.emit("chat-complete", &complete_json.to_string());
-    info!("[{}] start_chat 完成", file_name);
-    Ok(())
-}
-
-/// 隐藏主窗口（最小化到托盘）
-#[tauri::command]
-fn hide_main_window(window: WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())
-}
-
-/// 显示主窗口（由前端 rAF 回调，确认第一帧已绘制后调用）
-#[tauri::command]
-fn show_main_window(window: WebviewWindow) -> Result<(), String> {
-    window.show().map_err(|e| e.to_string())?;
-    window.set_focus().map_err(|e| e.to_string())
-}
-
-/// 写入文件内容到指定路径
-#[tauri::command]
-fn save_file(content: String, path: String) -> Result<(), String> {
-    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 打开日志目录
-#[tauri::command]
-fn open_log_dir() -> Result<(), String> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let log_dir = exe_dir.join("log");
-    if !log_dir.exists() {
-        std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
-    }
-    #[cfg(target_os = "windows")]
-    { std::process::Command::new("explorer").arg(&log_dir).spawn().map_err(|e| e.to_string())?; }
-    #[cfg(not(target_os = "windows"))]
-    { std::process::Command::new("open").arg(&log_dir).spawn().map_err(|e| e.to_string())?; }
-    Ok(())
-}
-
-/// 从自定义 OpenAI 兼容服务商获取可用模型列表
-#[tauri::command]
-async fn fetch_custom_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
-    if api_key.is_empty() {
-        return Err("API Key 不能为空".to_string());
-    }
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("Base URL 不能为空".to_string());
-    }
-
-    // 标准化双斜杠
-    let normalized = trimmed.replace("//", "/").replacen(":/", "://", 1);
-
-    // 构造候选 URL（按优先级排列）
-    let mut candidates: Vec<String> = Vec::new();
-    let lower = normalized.to_lowercase();
-
-    if lower.ends_with("/models") {
-        // 用户已提供完整 models 端点
-        candidates.push(normalized.clone());
-    } else if lower.ends_with("/v1") {
-        candidates.push(format!("{}/models", normalized));
-    } else {
-        candidates.push(format!("{}/v1/models", normalized));
-        candidates.push(format!("{}/models", normalized));
-    }
-
-    let client = api::http_client();
-    let mut last_err: Option<String> = None;
-
-    for url in &candidates {
-        let response = match client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(format!("请求失败: {}", e)),
-        };
-
-        let status = response.status();
-        if status.is_success() {
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| format!("解析响应失败: {}", e))?;
-
-            let mut models: Vec<String> = Vec::new();
-            if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
-                for entry in data {
-                    if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
-                        models.push(id.to_string());
-                    }
-                }
-            }
-            models.sort();
-            return Ok(models);
-        }
-
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            last_err = Some(format!("HTTP {}", status));
-            continue;
-        }
-
-        return Err(format!("HTTP {}: {}", status, response.text().await.unwrap_or_default()));
-    }
-
-    Err(format!("获取模型列表失败: {}", last_err.unwrap_or_else(|| "无候选端点".to_string())))
-}
-
-/// 获取可用服务商列表
-#[tauri::command]
-fn get_providers() -> Vec<ProviderInfo> {
-    provider::get_providers().into_iter().map(Into::into).collect()
-}
-
-/// 根据 API Key 前缀自动检测服务商并返回配置
-#[tauri::command]
-fn detect_provider(api_key: String) -> ProviderInfo {
-    let svc = provider::detect_provider(&api_key);
-    let info = provider::get_providers()
-        .into_iter()
-        .find(|p| match (&svc, p.id.as_str()) {
-            (provider::ServiceProvider::MimoApi, "mimo-api") => true,
-            (provider::ServiceProvider::MimoTokenPlan, "mimo-token-plan") => true,
-            _ => false,
-        })
-        .unwrap_or_else(|| provider::get_providers().into_iter().next().unwrap());
-    info.into()
-}
-
-/// 获取默认提示词模板
-#[tauri::command]
-fn get_default_prompt(template_type: String) -> Result<String, String> {
-    let tmpl = match template_type.as_str() {
-        "transcription" => prompt::default_transcription_template(),
-        "punctuation" => prompt::default_punctuation_template(),
-        _ => return Err(format!("未知模板类型: {}", template_type)),
-    };
-    Ok(serde_json::to_string(&tmpl).unwrap_or_default())
-}
-
-// ============================================================
-// WebView2 缓存清理
-// ============================================================
-
-fn clear_webview2_cache() {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let cache_dir = exe_dir.join(".mimo_cache");
-            if cache_dir.exists() {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-            }
-        }
-    }
-    let temp_audio = std::env::temp_dir().join("mimo_audio");
-    if temp_audio.exists() {
-        let _ = std::fs::remove_dir_all(&temp_audio);
-    }
-}
-
-/// 启动时清理所有遗留的 mimo_ 临时目录（崩溃/异常退出残留）
-fn cleanup_legacy_temp() {
-    let temp = std::env::temp_dir();
-    if let Ok(entries) = std::fs::read_dir(&temp) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("mimo_") {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
-}
-
-// ============================================================
-// 应用入口
-// ============================================================
+use state::{FfmpegBinState, TaskRegistry};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    log::init_log();
-
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main")
-                .or_else(|| app.webview_windows().into_iter().next().map(|(_, w)| w))
-            {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            tray::show_main_window_handle(app);
         }))
         .manage(rate_limiter::create_asr_limiter())
         .manage(rate_limiter::create_chat_limiter())
-        .manage(TaskRegistry { tasks: tokio::sync::Mutex::new(HashMap::new()) })
+        .manage(TaskRegistry {
+            tasks: tokio::sync::Mutex::new(HashMap::new()),
+        })
         .invoke_handler(tauri::generate_handler![
-            process_and_transcribe,
-            start_chat,
-            cancel_task,
-            pause_task,
-            resume_transcription,
-            cleanup_file_temp,
-            save_file,
-            get_providers,
-            detect_provider,
-            get_default_prompt,
-            get_audio_duration,
-            load_config,
-            save_config,
-            set_logging_enabled,
-            hide_main_window,
-            show_main_window,
-            open_log_dir,
-            fetch_custom_models,
+            commands::capabilities::get_capabilities,
+            commands::transcribe::process_and_transcribe,
+            commands::transcribe::cancel_task,
+            commands::transcribe::pause_task,
+            commands::transcribe::resume_transcription,
+            commands::transcribe::cleanup_file_temp,
+            commands::chat::start_chat,
+            commands::config::load_config,
+            commands::config::set_theme,
+            commands::config::set_slice_seconds,
+            commands::config::set_asr_provider,
+            commands::config::set_polish_selection,
+            commands::config::set_provider_key,
+            commands::config::upsert_custom_provider,
+            commands::config::delete_custom_provider,
+            commands::config::get_providers,
+            commands::config::detect_provider,
+            commands::config::get_default_prompt,
+            commands::config::fetch_custom_models,
+            commands::config::set_logging_enabled,
+            commands::fs::get_audio_duration,
+            commands::fs::export_file,
+            commands::fs::get_log_status,
+            commands::fs::open_log_dir,
+            commands::prompts::load_prompts,
+            commands::prompts::create_prompt,
+            commands::prompts::update_prompt,
+            commands::prompts::delete_prompt,
+            commands::prompts::reorder_prompts,
+            commands::prompts::select_prompt,
+            commands::prompts::builtin_default_content,
+            commands::prompts::open_prompt_dir,
+            tray::hide_main_window,
+            tray::show_main_window,
         ])
         .setup(|app| {
-            clear_webview2_cache();
-            cleanup_legacy_temp();
+            // B-09：日志目录迁至 app_log_dir（setup 阶段才有 AppHandle）
+            let log_dir = config::log_dir_for(app.handle());
+            log::init_log(&log_dir);
 
-            // 系统托盘图标
-            let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
-
-            let mut tray_builder = TrayIconBuilder::new()
-                .tooltip(format!("Mimo v{}", app.package_info().version))
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main")
-                            .or_else(|| app.webview_windows().into_iter().next().map(|(_, w)| w))
-                        {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+            // H-05：检测旧安装目录下的旧日志目录，只提示可发现性，不自动迁移未知文件
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let legacy_log = exe_dir.join("log");
+                    if legacy_log != log_dir && legacy_log.is_dir() {
+                        warn!("检测到旧安装目录下存在旧版日志目录，可从旧安装位置手动查看，本应用不会自动迁移");
                     }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main")
-                            .or_else(|| app.webview_windows().into_iter().next().map(|(_, w)| w))
-                        {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                });
-
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
+                }
             }
 
-            let _tray = tray_builder.build(app)?;
+            commands::fs::clear_webview2_cache();
+            commands::fs::cleanup_legacy_temp();
 
-            // 程序化创建主窗口（替代 tauri.conf.json 声明式配置）
-            let window = tauri::webview::WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("MiMo ASR Assistant")
-            .inner_size(1200.0, 800.0)
-            .min_inner_size(960.0, 640.0)
-            .decorations(false)
-            .center()
-            .visible(false)
-            .on_page_load(|webview, payload| {
-                if payload.event() == PageLoadEvent::Finished {
-                    let _ = webview.eval(r#"
-                        requestAnimationFrame(() => {
-                            requestAnimationFrame(() => {
-                                try {
-                                    window.__TAURI_INTERNALS__.invoke('show_main_window');
-                                } catch(e) {
-                                    console.error('[JS] invoke failed:', e);
-                                }
-                            });
-                        });
-                    "#);
+            // 捆绑 ffmpeg.exe 一次性 resolve（含 SHA-256 完整性校验）。
+            // 失败仅 warn 降级（转码/时长探测不可用），不阻断启动。
+            let ffmpeg_bin = match ffmpeg_exe::FfmpegBin::resolve(app.handle()) {
+                Ok(bin) => Some(bin),
+                Err(e) => {
+                    warn!(
+                        "捆绑 ffmpeg.exe 不可用，转码与媒体时长探测功能将被禁用: {}",
+                        e
+                    );
+                    None
                 }
-            })
-            .build()?;
-
-            // 检测系统主题，设置 WebView2 原生背景色
-            let bg_color = match window.theme() {
-                Ok(Theme::Light) => Color(248, 248, 247, 255),
-                _ => Color(17, 17, 17, 255),
             };
-            let _ = window.set_background_color(Some(bg_color));
+            app.manage(FfmpegBinState(ffmpeg_bin));
 
-            // 兜底：5 秒后无论如何显示窗口
-            let win_fallback = window.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                let _ = win_fallback.show();
-                let _ = win_fallback.set_focus();
-            });
+            // F-06：提示词仓库（prompts.json）。目录复用 B-09 的 app_config_dir
+            // 路径规则，不创建第二套目录规则；旧 config.json.polish_prompt 仅作为
+            // 一次性迁移来源（prompts.json 存在时不再读取旧字段）。
+            // P3：配置仓库单实例初始化（含迁移/损坏恢复/解密/只读判定），
+            // 运行期间的配置事实来源为该仓库，不再重复读磁盘。
+            let config_repo = config_store::ConfigRepository::init(app.handle());
+            let legacy_prompt = config_repo.initial_polish_prompt();
+            let prompts_dir = config::config_dir(app.handle());
+            app.manage(config_repo);
+            app.manage(prompt_store::PromptRepository::open(
+                prompts_dir,
+                &legacy_prompt,
+            ));
 
-            app.manage(window);
+            tray::setup_tray(app)?;
+            tray::create_main_window(app)?;
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    // Warning 6：日志 static 句柄在退出时不执行 Drop，
+    // 在 RunEvent::Exit 处显式 flush，避免丢失尾部日志
+    app.run(|_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            log::flush();
+        }
+    });
 }

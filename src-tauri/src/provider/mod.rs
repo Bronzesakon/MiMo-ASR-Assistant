@@ -25,7 +25,6 @@ pub struct ProviderInfo {
     pub chat_models: Vec<String>,
 }
 
-
 /// 根据 API Key 前缀自动识别服务商
 pub fn detect_provider(api_key: &str) -> ServiceProvider {
     if api_key.starts_with("tp-") {
@@ -64,7 +63,10 @@ pub fn get_providers() -> Vec<ProviderInfo> {
             base_url: "https://api.deepseek.com".to_string(),
             key_prefix: "sk-".to_string(),
             asr_models: vec![],
-            chat_models: vec!["deepseek-v4-pro".to_string(), "deepseek-v4-flash".to_string()],
+            chat_models: vec![
+                "deepseek-v4-pro".to_string(),
+                "deepseek-v4-flash".to_string(),
+            ],
         },
     ]
 }
@@ -75,9 +77,14 @@ mod tests {
 
     #[test]
     fn test_detect_provider() {
-        assert!(matches!(detect_provider("sk-xxx"), ServiceProvider::MimoApi));
-        assert!(matches!(detect_provider("tp-xxx"), ServiceProvider::MimoTokenPlan));
+        assert!(matches!(
+            detect_provider("sk-xxx"),
+            ServiceProvider::MimoApi
+        ));
+        assert!(matches!(
+            detect_provider("tp-xxx"),
+            ServiceProvider::MimoTokenPlan
+        ));
         assert!(matches!(detect_provider("other"), ServiceProvider::MimoApi));
     }
-
 }

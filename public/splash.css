@@ -1,0 +1,108 @@
+/* 启动屏样式（自 index.html 内联 <style> 外置，满足 CSP style-src 'self'，清单 S-01/Q-00） */
+:root {
+  --bg: #111;
+  --fg: #ededec;
+  --fg2: #6f6f6e;
+  --bar-bg: #1f1f1f;
+  --bar-fill: #6e9eff;
+  --ver: #2a2a2a;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f8f8f7;
+    --fg: #1a1a19;
+    --fg2: #9c9c9b;
+    --bar-bg: #e4e4e3;
+    --bar-fill: #2563eb;
+    --ver: #d0d0cf;
+  }
+}
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none;
+  user-select: none;
+}
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  background: var(--bg);
+  color: var(--fg);
+  opacity: 1;
+  transition: opacity 0.35s ease-out;
+}
+#splash.done {
+  opacity: 0;
+  pointer-events: none;
+}
+.sp-logo {
+  width: 72px;
+  height: 72px;
+  border-radius: 18px;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+.sp-logo img {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.sp-name {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: -0.01em;
+}
+.sp-sub {
+  font-size: 12px;
+  color: var(--fg2);
+}
+.sp-bar {
+  width: 100px;
+  height: 2px;
+  background: var(--bar-bg);
+  border-radius: 1px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+.sp-bar > i {
+  display: block;
+  width: 30%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--bar-fill), transparent);
+  border-radius: 1px;
+  animation: sp-s 1.2s ease-in-out infinite;
+}
+@keyframes sp-s {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+.sp-ver {
+  position: absolute;
+  bottom: 16px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 10px;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  color: var(--ver);
+}

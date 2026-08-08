@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { useAppStore } from '../stores/app'
-const store = useAppStore()
+import { useFilesStore } from '../stores/files'
+const store = useFilesStore()
 </script>
 
 <template>

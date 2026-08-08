@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// 默认润色系统提示词（清单 B-11：单一常量定义，两处引用）。
+/// 注意：与 prompt_store::DEFAULT_POLISH_PROMPT（F-06 规整默认正文）是不同文本，
+/// 本常量仅服务 get_default_prompt 模板接口。
+pub const DEFAULT_POLISH_PROMPT: &str = "你是一个专业的文本润色助手。请对用户提供的语音转文字结果进行润色，修正错别字、调整语序、补充标点，使其更加通顺自然。保持原意不变，不要添加额外内容。";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptTemplate {
     pub system: String,
@@ -10,7 +15,7 @@ pub struct PromptTemplate {
 impl Default for PromptTemplate {
     fn default() -> Self {
         Self {
-            system: "你是一个专业的文本润色助手。请对用户提供的语音转文字结果进行润色，修正错别字、调整语序、补充标点，使其更加通顺自然。保持原意不变，不要添加额外内容。".to_string(),
+            system: DEFAULT_POLISH_PROMPT.to_string(),
             user_prefix: String::new(),
             user_suffix: String::new(),
         }
@@ -41,7 +46,7 @@ pub fn build_prompt(template: &PromptTemplate, user_input: &str) -> String {
 /// 语音转文字后处理的默认模板
 pub fn default_transcription_template() -> PromptTemplate {
     PromptTemplate {
-        system: "你是一个专业的文本润色助手。请对用户提供的语音转文字结果进行润色，修正错别字、调整语序、补充标点，使其更加通顺自然。保持原意不变，不要添加额外内容。".to_string(),
+        system: DEFAULT_POLISH_PROMPT.to_string(),
         user_prefix: "请润色以下语音转文字结果：".to_string(),
         user_suffix: String::new(),
     }
