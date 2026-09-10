@@ -140,9 +140,9 @@ pub async fn cancel_task(
             }
             let finished = {
                 let tasks = registry.tasks.lock().await;
-                !tasks
+                tasks
                     .get(&file_id)
-                    .is_some_and(|task| task.generation == actual_generation)
+                    .is_none_or(|task| task.generation != actual_generation)
             };
             if finished {
                 break;
@@ -359,7 +359,7 @@ pub async fn resume_transcription(
         if token.is_cancelled() {
             crate::info!("[{}] resume_transcription 已取消", file_name);
             finish_task(&registry, &file_id, generation, true).await;
-            let _ = envelope.emit(
+            envelope.emit(
                 "transcription-cancelled",
                 crate::state::TaskEventKind::Cancelled,
                 &serde_json::json!({}),
@@ -398,7 +398,7 @@ pub async fn resume_transcription(
             Err(_) => {
                 crate::info!("[{}] resume 排队等待许可时已取消", file_name);
                 finish_task(&registry, &file_id, generation, true).await;
-                let _ = envelope.emit(
+                envelope.emit(
                     "transcription-cancelled",
                     crate::state::TaskEventKind::Cancelled,
                     &serde_json::json!({}),
@@ -421,7 +421,7 @@ pub async fn resume_transcription(
                     index
                 );
                 finish_task(&registry, &file_id, generation, true).await;
-                let _ = envelope.emit(
+                envelope.emit(
                     "transcription-cancelled",
                     crate::state::TaskEventKind::Cancelled,
                     &serde_json::json!({}),
@@ -451,7 +451,7 @@ pub async fn resume_transcription(
         } else {
             0.0
         };
-        let _ = envelope.emit(
+        envelope.emit(
             "status-update",
             crate::state::TaskEventKind::Stage,
             &serde_json::json!({
@@ -774,7 +774,7 @@ pub async fn process_and_transcribe(
                     // 取消已置位：执行取消终结，不发送暂停事件
                     if token.is_cancelled() {
                         finish_task(&registry, &file_id, generation, true).await;
-                        let _ = envelope.emit(
+                        envelope.emit(
                             "transcription-cancelled",
                             crate::state::TaskEventKind::Cancelled,
                             &serde_json::json!({}),
@@ -825,7 +825,7 @@ pub async fn process_and_transcribe(
     let is_cancelled = token.is_cancelled();
     if is_cancelled {
         finish_task(&registry, &file_id, generation, true).await;
-        let _ = envelope.emit(
+        envelope.emit(
             "transcription-cancelled",
             crate::state::TaskEventKind::Cancelled,
             &serde_json::json!({}),

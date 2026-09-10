@@ -51,7 +51,24 @@ Get-FileHash src-tauri\resources\ffmpeg.exe -Algorithm SHA256
 ## 依赖审计现状（清单 I-02）
 
 - `npm audit --omit=dev`：**0 漏洞**（PostCSS high 已于 2026-08 通过锁文件升级 8.5.15 → 8.5.25 修复，传递依赖，来自 vite / @vue/compiler-sfc）。
-- `cargo audit --deny warnings`：已接入 CI security job（固定版本 cargo-audit 0.21.2）。当前无已记录的临时例外；若未来需要 ignore 单个 advisory，必须在此登记原因、上游链接、到期日期与负责人。
+- `cargo audit --deny warnings`：已接入 CI security job，cargo-audit 固定为 **0.22.2**（原 0.21.2 已弃用：该版本无法解析 advisory-db 中新增的 CVSS 4.0 条目，`error loading advisory database: unsupported CVSS version: 4.0`，与漏洞无关却恒使 job 失败）。
+- 2026-09-10 锁文件升级已消除全部可修复项：`anyhow` 1.0.102 → 1.0.104、`event-listener` 5.4.1 → 5.4.2、`h2` 0.4.15 → 0.4.19、`plist` 1.9.0 → 1.10.1（带动 `quick-xml` 0.39.4 → 0.42.0）。**当前 0 漏洞。**
+- 其余 7 条 warning 均无可用修复，按 ID 精确豁免（清单见 `src-tauri/.cargo/audit.toml`），逐条登记如下。
+
+### 已登记例外（到期需复查）
+
+| Advisory | Crate / 版本 | 类型 | 豁免原因 | 上游链接 | 到期日期 | 负责人 |
+|----------|--------------|------|----------|----------|----------|--------|
+| RUSTSEC-2024-0429 | glib 0.18.5 | unsound | Linux GTK 链，Windows 目标不编译；修复需 gtk-rs 0.20，只能随 tauri 上游升级 | https://rustsec.org/advisories/RUSTSEC-2024-0429 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2024-0370 | proc-macro-error 1.0.4 | unmaintained | 经 glib-macros / gtk3-macros 进入 Linux GTK 链，Windows 目标不编译 | https://rustsec.org/advisories/RUSTSEC-2024-0370 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2025-0075 | unic-char-range 0.9.0 | unmaintained | 经 tauri-utils → urlpattern 0.3 引入，上游未发布替代版本 | https://rustsec.org/advisories/RUSTSEC-2025-0075 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2025-0080 | unic-common 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0080 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2025-0081 | unic-char-property 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0081 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2025-0098 | unic-ucd-version 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0098 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2025-0100 | unic-ucd-ident 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0100 | 2026-12-10 | @Bronzesakon |
+
+**复查要求**：到期前重跑 `cargo audit --deny warnings`，若上游已发布修复（tauri 升级 gtk-rs / urlpattern 换依赖），则升级依赖并删除对应 ignore；否则重新评估风险并顺延到期日期。豁免仅限上表 ID，任何新增 advisory 仍会阻断 CI。
+
 - moderate/low 级别暂缓项登记：（暂无）。
 
 ## 数据与隐私

@@ -533,8 +533,10 @@ mod tests {
     fn debug_output_redacts_prompt_body_and_secrets() {
         let secret = "sk-TEST-SENTINEL-SECRET-42";
         let prompt_body = "这是不应出现在日志里的提示词正文 SENTINEL_PROMPT";
-        let mut cfg = AppConfig::default();
-        cfg.api_key = secret.to_string();
+        let mut cfg = AppConfig {
+            api_key: secret.to_string(),
+            ..Default::default()
+        };
         cfg.provider_keys
             .insert("deepseek".to_string(), secret.to_string());
         cfg.polish_prompt = prompt_body.to_string();

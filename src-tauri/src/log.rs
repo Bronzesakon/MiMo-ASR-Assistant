@@ -187,6 +187,7 @@ fn rotate_to_new_file(lw: &mut LogWriter) {
 /// 保留策略（P7-02）：只扫描严格匹配命名规则的普通文件。
 /// 1. 先按时间删除超出 `MAX_FILES` 的旧文件；
 /// 2. 再按总字节数继续删除最旧文件，直到目录总量 ≤ `MAX_TOTAL_BYTES`。
+///
 /// 清理失败写 stderr，但不阻断启动。
 fn cleanup_old_logs(log_dir: &Path) {
     let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
@@ -437,7 +438,7 @@ mod tests {
     fn write_failure_marks_failed_and_does_not_count() {
         let dir = test_dir("write_fail");
         let mut lw = writer_in(&dir);
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "注入的写入失败");
+        let err = std::io::Error::other("注入的写入失败");
 
         // 写入成功：递增未刷盘计数
         handle_write_result(&mut lw, 10, Ok(()));
@@ -459,7 +460,7 @@ mod tests {
         let dir = test_dir("flush_fail");
         let mut lw = writer_in(&dir);
         lw.unflushed = 5;
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "注入的刷新失败");
+        let err = std::io::Error::other("注入的刷新失败");
 
         // flush 成功：清零计数并更新 last_flush，健康保持
         handle_flush_result(&mut lw, Ok(()));

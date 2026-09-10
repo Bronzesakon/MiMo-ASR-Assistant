@@ -1,0 +1,20 @@
+# cargo-audit 配置（CI security job 与本地执行共用）
+#
+# 例外策略：列表中的 advisory 均已按 SECURITY.md「依赖审计现状」登记
+# （原因 / 上游链接 / 到期日期 / 负责人），且都**无可用修复**：
+#   A. Linux GTK 链（Windows 目标不编译）：经 tauri → gtk 0.18 → glib/gtk3-macros 引入，
+#      只能随 tauri 上游升级 gtk-rs 才能消除，本仓库无法在 Cargo.lock 层面修复。
+#   B. unic-* 停维护链：经 tauri-utils → urlpattern 0.3 引入（全平台），上游未发布替代。
+# 其余任何新 advisory 不在豁免范围，`--deny warnings` 仍会使其阻断 CI。
+[advisories]
+ignore = [
+  # A. Linux GTK 链（Windows 目标不编译）
+  "RUSTSEC-2024-0429", # glib 0.18.5 unsound（Iterator impl），gtk-rs 0.20 才修复
+  "RUSTSEC-2024-0370", # proc-macro-error 1.0.4 unmaintained（经 glib-macros/gtk3-macros）
+  # B. unic-* 停维护链（经 urlpattern ← tauri-utils）
+  "RUSTSEC-2025-0075", # unic-char-range 0.9.0 unmaintained
+  "RUSTSEC-2025-0080", # unic-common 0.9.0 unmaintained
+  "RUSTSEC-2025-0081", # unic-char-property 0.9.0 unmaintained
+  "RUSTSEC-2025-0098", # unic-ucd-version 0.9.0 unmaintained
+  "RUSTSEC-2025-0100", # unic-ucd-ident 0.9.0 unmaintained
+]

@@ -68,17 +68,17 @@ pub struct ConfigRepoState {
 /// 敏感字段路径（用于向前端标识"需要重新输入"的 key）
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SecretPath {
-    ApiKey,
-    ProviderKey(String),
-    CustomProviderKey(String),
+    Api,
+    Provider(String),
+    CustomProvider(String),
 }
 
 impl SecretPath {
     fn as_issue_string(&self) -> String {
         match self {
-            SecretPath::ApiKey => "api_key".to_string(),
-            SecretPath::ProviderKey(id) => format!("provider_keys.{}", id),
-            SecretPath::CustomProviderKey(id) => format!("custom_providers.{}.api_key", id),
+            SecretPath::Api => "api_key".to_string(),
+            SecretPath::Provider(id) => format!("provider_keys.{}", id),
+            SecretPath::CustomProvider(id) => format!("custom_providers.{}.api_key", id),
         }
     }
 }
@@ -279,7 +279,7 @@ impl ConfigRepository {
                 .insert(provider_id.clone(), key);
             Ok(MutationOutcome {
                 doc: candidate,
-                cleared: vec![SecretPath::ProviderKey(provider_id)],
+                cleared: vec![SecretPath::Provider(provider_id)],
                 side_effect: None,
             })
         })
@@ -313,7 +313,7 @@ impl ConfigRepository {
             }
             Ok(MutationOutcome {
                 doc: candidate,
-                cleared: vec![SecretPath::CustomProviderKey(cp.id)],
+                cleared: vec![SecretPath::CustomProvider(cp.id)],
                 side_effect: None,
             })
         })
@@ -338,7 +338,7 @@ impl ConfigRepository {
             // 若删除的是当前选中的 polish 服务商，normalize_polish_config 会回退到内置默认
             Ok(MutationOutcome {
                 doc: candidate,
-                cleared: vec![SecretPath::CustomProviderKey(provider_id)],
+                cleared: vec![SecretPath::CustomProvider(provider_id)],
                 side_effect: None,
             })
         })
@@ -513,7 +513,7 @@ fn decrypt_config_fields_tracked(
             Ok(d) => config.api_key = d,
             Err(e) => {
                 crate::error!("API Key 解密失败: {}", e);
-                unreadable.insert(SecretPath::ApiKey, e);
+                unreadable.insert(SecretPath::Api, e);
             }
         }
     }
@@ -523,7 +523,7 @@ fn decrypt_config_fields_tracked(
                 Ok(d) => *value = d,
                 Err(e) => {
                     crate::error!("Provider Key [{}] 解密失败: {}", pid, e);
-                    unreadable.insert(SecretPath::ProviderKey(pid.clone()), e);
+                    unreadable.insert(SecretPath::Provider(pid.clone()), e);
                 }
             }
         }
@@ -534,7 +534,7 @@ fn decrypt_config_fields_tracked(
                 Ok(d) => cp.api_key = d,
                 Err(e) => {
                     crate::error!("[{}] 自定义服务商 Key 解密失败: {}", cp.name, e);
-                    unreadable.insert(SecretPath::CustomProviderKey(cp.id.clone()), e);
+                    unreadable.insert(SecretPath::CustomProvider(cp.id.clone()), e);
                 }
             }
         }

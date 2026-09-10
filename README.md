@@ -67,15 +67,22 @@ npm install
 npm run tauri dev
 
 # 构建生产版本（生成 exe + 安装包）
+# 可选：CI 已能产出同样的安装包（见「CI」的 package job），
+# 本地不必保留 target/ 这类重产物，需要时从 CI Artifacts 下载
 npm run tauri build
 
 # 仅检查 Rust 语法
 cd src-tauri && cargo check
 ```
 
-构建产物：
+本地构建产物（均可随时删除、按需重建，且已在 `.gitignore` 中）：
+- `src-tauri/target/`（体积最大，Rust 编译中间产物与 release 产物）
 - `src-tauri/target/release/mimo-asr-assistant.exe`
-- `src-tauri/target/release/bundle/nsis/` (NSIS 安装包，内含 resources/ffmpeg.exe)
+- `src-tauri/target/release/bundle/nsis/`（NSIS 安装包，内含 resources/ffmpeg.exe）
+- `dist/`（前端构建输出）
+
+发布用的安装包由 CI `package` job 产出，因此本地只需保留 `node_modules/`（开发/门禁命令依赖），
+其余构建输出可以删除；用 `npm run tauri dev` 时 Rust 会按需增量重编。
 
 ### 质量门禁（清单 Q-00）
 
@@ -92,7 +99,7 @@ npm run version:check  # 核对 package.json / tauri.conf.json / Cargo.toml 三�
 # Rust（在 src-tauri 目录执行）
 cargo check            # 编译检查
 cargo test             # 单元测试（DPAPI 相关测试依赖 Windows）
-cargo clippy -- -D warnings   # lint 零容忍
+cargo clippy --all-targets -- -D warnings   # lint 零容忍（含测试目标）
 
 # Tauri 开发冒烟
 npm run tauri dev
@@ -108,8 +115,16 @@ npm run tauri dev
 | Job | 内容 |
 |-----|------|
 | `frontend` | npm ci → typecheck → lint → vitest → build → version:check |
-| `rust` | ffmpeg.exe SHA-256 基准比对 → cargo check/test/clippy（均 `--locked`；build.rs 门禁编译期再校验一次哈希） |
-| `security` | `npm audit --omit=dev --audit-level=high` + 固定版本 `cargo audit --deny warnings` |
+| `rust` | ffmpeg.exe SHA-256 基准比对 → cargo check/test/clippy --all-targets（均 `--locked`；build.rs 门禁编译期再校验一次哈希） |
+| `security` | `npm audit --omit=dev --audit-level=high` + 固定版本 `cargo audit --deny warnings`（已登记例外见 `src-tauri/.cargo/audit.toml` 与 SECURITY.md） |
+| `package` | 仅在 `v*` tag 或手动 dispatch 时运行：`tauri build --bundles nsis` → 静默安装校验 ffmpeg/WebView2Loader 与哈希 → 上传安装包与免安装 exe 为 artifact |
+
+**从 CI 取安装包**（本地不再需要 `src-tauri/target/`）：
+
+1. 打 tag（`git tag v1.1.5 && git push origin v1.1.5`）或到 Actions → CI → Run workflow 手动触发；
+   tag 触发时会校验 tag 与 `package.json` 版本一致，不一致直接失败。
+2. 等待 `package` job 完成，在该次运行页面底部 **Artifacts** 下载 `mimo-asr-assistant-<ref>`。
+3. artifact 保留 30 天；需要长期存档时下载后自行归档（或后续加一步 Release 上传，需 job 级 `contents: write` 权限，当前刻意未启用）。
 
 说明：
 - CI 不运行需要真实 API Key 的在线转写；真实服务端到端冒烟保留为发布前**人工步骤**（见「发布检查清单」），CI 不宣称覆盖桌面 UI 冒烟。
@@ -181,9 +196,9 @@ npm run tauri version <x.y.z>
 
 1. **版本同步**：`npm run tauri version <x.y.z>` 后 `npm run version:check` 三处一致。
 2. **锁文件**：`package-lock.json` 与 `src-tauri/Cargo.lock` 已提交且未漂移。
-3. **CI 全绿**：`frontend` / `rust` / `security` 三 job 全部通过；本地等价命令见「质量门禁」。
-4. **依赖审计**：`npm audit --omit=dev` 无 high/critical；`cargo audit --deny warnings` 通过（或例外已在 SECURITY.md 登记到期日）。
-5. **release 构建**：`npm run tauri build` 成功生成 NSIS 安装包。
+3. **CI 全绿**：`frontend` / `rust` / `security` 三 job 全部通过；tag/手动触发的 `package` job 亦通过；本地等价命令见「质量门禁」。
+4. **依赖审计**：`npm audit --omit=dev` 无 high/critical；`cargo audit --deny warnings` 通过（例外已在 SECURITY.md 登记到期日，且仅限 `src-tauri/.cargo/audit.toml` 中的 ID）。
+5. **release 构建（在 CI）**：推 `v*` tag（或手动 dispatch）后 `package` job 成功，从该次运行页面的 Artifacts 下载 NSIS 安装包与免安装 exe。本地 `npm run tauri build` 为等价可选路径，非必需。
 6. **安装包 ffmpeg 校验**：安装后确认安装目录下 `resources/ffmpeg.exe` 存在，且与 `src-tauri/resources/ffmpeg.exe.sha256` 哈希一致：
    ```powershell
    Get-FileHash <安装目录>\resources\ffmpeg.exe -Algorithm SHA256

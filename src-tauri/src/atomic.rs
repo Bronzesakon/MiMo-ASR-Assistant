@@ -95,12 +95,12 @@ fn update_backup(path: &Path, _tmp: &Path) -> io::Result<()> {
 }
 
 fn write_tmp(tmp: &Path, content: &str) -> io::Result<()> {
-    fault_point(atomic::FaultPoint::WriteAll)?;
+    fault_point(fault::FaultPoint::WriteAll)?;
     let mut f = std::fs::File::create(tmp)?;
     f.write_all(content.as_bytes())?;
-    fault_point(atomic::FaultPoint::Flush)?;
+    fault_point(fault::FaultPoint::Flush)?;
     f.flush()?;
-    fault_point(atomic::FaultPoint::SyncAll)?;
+    fault_point(fault::FaultPoint::SyncAll)?;
     f.sync_all()?;
     Ok(())
 }
@@ -124,7 +124,7 @@ fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
         .encode_wide()
         .chain(Some(0))
         .collect();
-    fault_point(atomic::FaultPoint::ReplaceMain)?;
+    fault_point(fault::FaultPoint::ReplaceMain)?;
     let r = unsafe {
         MoveFileExW(
             src_w.as_ptr(),
@@ -141,14 +141,14 @@ fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
-    fault_point(atomic::FaultPoint::ReplaceMain)?;
+    fault_point(fault::FaultPoint::ReplaceMain)?;
     std::fs::rename(src, dst)
 }
 
 /// 原子写内部步骤（P0-03 故障注入点）。
 /// `pub(crate)` 使其可被 audio 域测试复用（P4-03 验证 create_task_temp_dir
 /// 的元数据原子写在任一阶段失败时回滚目录）。生产路径恒为 `Ok(())`。
-pub(crate) mod atomic {
+pub(crate) mod fault {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum FaultPoint {
         WriteAll,
@@ -160,16 +160,16 @@ pub(crate) mod atomic {
 
 /// 供其它模块（如 audio）的测试复用原子写故障注入开关，仅测试可见。
 #[cfg(test)]
-pub(crate) use atomic::FaultPoint;
+pub(crate) use fault::FaultPoint;
 
 /// 故障注入：仅在 `#[cfg(test)]` 下生效。测试通过 `set_fail_at` 指定某一步
 /// 返回错误，生产路径恒为 `Ok(())`。
 #[cfg(test)]
-fn fault_point(point: atomic::FaultPoint) -> io::Result<()> {
+fn fault_point(point: fault::FaultPoint) -> io::Result<()> {
     match fault_inject::with_lock(|guard| {
         if *guard == Some(point) {
             *guard = None; // 只失败一次
-            Some(io::Error::new(io::ErrorKind::Other, "注入的原子写故障"))
+            Some(io::Error::other("注入的原子写故障"))
         } else {
             None
         }
@@ -180,12 +180,12 @@ fn fault_point(point: atomic::FaultPoint) -> io::Result<()> {
 }
 
 #[cfg(not(test))]
-fn fault_point(_point: atomic::FaultPoint) -> io::Result<()> {
+fn fault_point(_point: fault::FaultPoint) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
-pub(crate) fn set_fail_at(point: atomic::FaultPoint) {
+pub(crate) fn set_fail_at(point: fault::FaultPoint) {
     fault_inject::with_lock(|guard| {
         *guard = Some(point);
         None
@@ -200,10 +200,13 @@ mod fault_inject {
     use std::cell::RefCell;
     use std::sync::Mutex;
 
-    use super::atomic::FaultPoint;
+    use super::fault::FaultPoint;
 
     thread_local! {
-        static FAIL_AT: RefCell<Option<FaultPoint>> = RefCell::new(None);
+        // 初始化器已写成文档规定的 const 块形式，但 clippy 1.96 在该写法上
+        // 仍报 missing_const_for_thread_local（建议值与现状一致），属误报。
+        #[allow(clippy::missing_const_for_thread_local)]
+        static FAIL_AT: RefCell<Option<FaultPoint>> = const { RefCell::new(None) };
     }
 
     /// 在锁内执行闭包；返回 `Some(err)` 时向外传播为写失败，`None` 表示无故障。
@@ -224,7 +227,7 @@ mod fault_inject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomic::FaultPoint;
+    use fault::FaultPoint;
 
     fn test_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
