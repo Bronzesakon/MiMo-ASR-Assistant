@@ -220,8 +220,40 @@ jobs:
       # RustSec 审计：cargo-audit 安装版本固定，避免供应链漂移。
       # 0.22.2 为下限：0.21.2 无法解析 advisory-db 的 CVSS 4.0 条目，
       # 会以 `unsupported CVSS version: 4.0` 恒失败（与漏洞无关）。
-      - name: Install cargo-audit (pinned version)
-        run: cargo install cargo-audit --version 0.22.2 --locked
+      #
+      # 编译一次约 6-7 分钟，故缓存编好的二进制（key 含版本与 OS）。
+      # 仍是本机从 crates.io 源码构建，不引入预编译二进制，供应链模型不变。
+      - name: Cache cargo-audit binary (pinned 0.22.2)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit.exe
+          key: cargo-audit-0.22.2-${{ runner.os }}
+
+      # 缓存可能来自旧 runner 镜像或已损坏：执行前自检，不可用则重新编译兜底
+      - name: Ensure cargo-audit is usable (rebuild if cache stale)
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:USERPROFILE ".cargo\bin\cargo-audit.exe"
+          $usable = $false
+          if (Test-Path $exe) {
+            try {
+              $out = & $exe --version 2>&1
+              if ($LASTEXITCODE -eq 0 -and "$out" -match '0\.22\.2') {
+                Write-Host "cargo-audit restored from cache: $out"
+                $usable = $true
+              }
+            } catch {
+              Write-Host "cached cargo-audit not runnable: $_"
+            }
+          }
+          if (-not $usable) {
+            Write-Host "cargo-audit missing or unusable - compiling from crates.io source"
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            cargo install cargo-audit --version 0.22.2 --locked
+            if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-audit failed" }
+            $out = & $exe --version
+            Write-Host "cargo-audit compiled: $out"
+          }
 
       # 已登记例外见 src-tauri/.cargo/audit.toml 与 SECURITY.md；
       # 未登记的新 advisory 仍会以 --deny warnings 阻断
