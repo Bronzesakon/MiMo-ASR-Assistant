@@ -198,7 +198,10 @@ jobs:
       # 静默安装到隔离目录，逐项核对安装包是否真的带上了编译期声明的静态资产。
       # 资产清单直接从 tauri.conf.json 的 bundle.resources 读取（不硬编码），
       # 以后往配置里新增资源文件也会被这里自动校验，不会漏检。
-      - name: Verify installed package contains all declared static assets
+      # 同时核对主程序的图标 / 版本 / manifest 资源：MSVC link.exe 对多个带 .rsrc
+      # 的链接输入只保留一个，一旦有人在 build.rs 里再给 bin 追加资源对象，图标会
+      # 被静默丢弃（GNU ld 会合并，本机看不出来），故在此设硬门禁。
+      - name: Verify installed package assets, icon and version resources
         shell: pwsh
         run: |
           $nsis = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
@@ -237,6 +240,33 @@ jobs:
           $installed = (Get-FileHash (Join-Path $installDir "resources\ffmpeg.exe") -Algorithm SHA256).Hash.ToUpper()
           if ($installed -ne $expected) { throw "installed ffmpeg.exe hash mismatch" }
           Write-Host "Package integrity OK, ffmpeg SHA-256 = $installed"
+
+          # 4) 主程序必须真的带图标（资源管理器/任务栏看到的就是它）与 VERSION 信息。
+          #    ExtractIconEx(-1) 返回图标个数，0 即无图标资源 —— 正是资源对象互覆盖的症状。
+          Add-Type -Namespace Mimo -Name IconApi -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string lpszFile, int nIconIndex, IntPtr[] phiconLarge, IntPtr[] phiconSmall, uint nIcons);'
+          $iconCount = [Mimo.IconApi]::ExtractIconEx($main.FullName, -1, $null, $null, 0)
+          if ($iconCount -lt 1) { throw "application exe has no icon resource: $($main.Name)" }
+          Write-Host "application exe icon resource OK: $($main.Name), icons=$iconCount"
+
+          $version = $main.VersionInfo
+          if ([string]::IsNullOrWhiteSpace($version.ProductName)) {
+            throw "application exe has no VERSION resource (ProductName empty): $($main.Name)"
+          }
+          Write-Host "application exe version resource OK: ProductName=$($version.ProductName) FileVersion=$($version.FileVersion)"
+
+          # tauri-build 的默认 app manifest（comctl32 v6）必须仍在 exe 里：bin 不再靠
+          # build.rs 的 windres 资源对象补 manifest，若这条丢了说明资源对象又被打包漏掉。
+          $mainText = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($main.FullName))
+          if ($mainText -notmatch 'Microsoft\.Windows\.Common-Controls') {
+            throw "application exe is missing the comctl32 v6 manifest resource: $($main.Name)"
+          }
+          Write-Host "application exe comctl32 v6 manifest OK"
+
+          # 5) 安装包本体同样要带图标（下载到本地后资源管理器显示的就是它；
+          #    浏览器下载列表里显示的是通用文件类型图标，与文件内嵌图标无关）
+          $setupIcons = [Mimo.IconApi]::ExtractIconEx($nsis.FullName, -1, $null, $null, 0)
+          if ($setupIcons -lt 1) { throw "NSIS installer has no icon resource: $($nsis.Name)" }
+          Write-Host "installer icon resource OK: $($nsis.Name), icons=$setupIcons"
 
       # tag 触发时校验 tag 与 package.json 版本一致，避免产物名与版本错配。
       # 用 $env:GITHUB_REF_NAME 而不是 ${{ github.ref_name }}：免模板替换，

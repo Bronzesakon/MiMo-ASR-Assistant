@@ -21,16 +21,28 @@ fn main() {
     println!("cargo:rerun-if-changed=resources/ffmpeg.exe.sha256");
     verify_ffmpeg();
     tauri_build::build();
-    // T-09：为测试目标嵌入 comctl32 v6 manifest。
-    // 测试 exe 无主应用的 tauri manifest，加载 comctl32 v5(5.82) 缺 TaskDialogIndirect → 0xc0000139；
-    // 仅在测试目标附加，不影响主 bin。
+    // T-09：给测试目标补 comctl32 v6 manifest（测试 exe 拿不到 tauri-build 的
+    // 资源对象，其 embed-resource 只发 `cargo:rustc-link-arg-bins`）。
+    // 注意不能再用“往所有目标塞一个 windres 资源对象”的做法：MSVC 下那个对象的
+    // .rsrc 会顶掉 tauri 资源对象里的图标与版本信息，产物 exe 只剩 manifest
+    // （CI 安装包图标丢失的根因）。分流细节见函数头注释。
     embed_test_common_controls_v6_manifest();
 }
 
 /// T-09：给测试目标嵌入 Microsoft.Windows.Common-Controls 6.0 manifest，
-/// 使测试 exe 激活 WinSxS 的 comctl32 v6（否则静态导入的 TaskDialogIndirect/
-/// SetWindowSubclass 等在系统 v5 上缺失，测试 exe 以 0xc0000139 退出）。
-/// 使用 `cargo:rustc-link-arg-tests`（Cargo 1.66+），只作用于测试链接目标。
+/// 使测试 exe 激活 WinSxS 的 comctl32 v6（否则静态导入的 TaskDialogIndirect
+/// 在系统 v5.82 上不存在 —— 已实测 System32\comctl32.dll 只导出
+/// SetWindowSubclass 等，不导出 TaskDialogIndirect —— 测试 exe 以 0xc0000139 退出）。
+///
+/// 主 bin 不需要这份：`tauri_build::build()` 的默认 `WindowsAttributes::new()`
+/// 已把同样内容的 comctl32 v6 manifest 与图标、版本信息编进同一个资源对象。
+///
+/// 两条工具链路径必须分开，实测结论（MSVC link.exe / GNU ld，均为本机实测）：
+///   - MSVC：链接输入里若有“对象文件的 .rsrc”，资源管理段会整体覆盖从 .lib 里
+///     取出的资源成员 —— 图标和 VERSION 全部丢失。因此这里不用 windres 对象，
+///     而是用链接器自带的 manifest 生成（不产生第二个 .rsrc），并对 bin 关掉生成
+///     （bin 已有 tauri 的 manifest，重复会 CVT1100 资源重复而链接失败）。
+///   - GNU：ld 会合并 .rsrc，所以沿用 windres 对象，本地 dev/release-build.bat 不受影响。
 #[cfg(target_os = "windows")]
 fn embed_test_common_controls_v6_manifest() {
     use std::env;
@@ -55,12 +67,32 @@ fn embed_test_common_controls_v6_manifest() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_path = out_dir.join("common_controls_v6.manifest");
+
+    if fs::write(&manifest_path, COMCTL6_MANIFEST).is_err() {
+        eprintln!(
+            "[build.rs] 无法写入 comctl32 v6 manifest 临时文件；测试 exe 可能以 0xc0000139 退出"
+        );
+        return;
+    }
+
+    // CARGO_CFG_TARGET_ENV 由 cargo 按“目标”而非宿主设置，交叉编译也正确。
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env == "msvc" {
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
+            manifest_path.display()
+        );
+        // bin 侧：tauri-build 的资源对象已经带了 manifest（RT_MANIFEST id 1）。
+        // 再让链接器生成一个会因资源重复直接失败（CVT1100），故关闭生成；
+        // link.exe 会提示 LNK4075「/MANIFESTINPUT 被 /MANIFEST:NO 忽略」，属预期。
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
+        return;
+    }
+
     let rc_path = out_dir.join("common_controls_v6.rc");
     let res_path = out_dir.join("common_controls_v6_res.o");
-
-    if fs::write(&manifest_path, COMCTL6_MANIFEST).is_err()
-        || fs::write(&rc_path, "1 24 \"common_controls_v6.manifest\"\n").is_err()
-    {
+    if fs::write(&rc_path, "1 24 \"common_controls_v6.manifest\"\n").is_err() {
         eprintln!(
             "[build.rs] 无法写入 comctl32 v6 manifest 临时文件；测试 exe 可能以 0xc0000139 退出"
         );
@@ -78,8 +110,8 @@ fn embed_test_common_controls_v6_manifest() {
         Err(_) => false,
     };
     if ok {
-        // 附加到所有链接目标（bin + 测试）。主 bin 的 tauri-build 在 GNU 下不嵌
-        // comctl32 v6 manifest，此处一并补齐（rfd 对话框同样需要 v6）。
+        // 注意：这条对所有链接目标生效（含 bin）。GNU ld 会合并 .rsrc，所以 bin 的
+        // 图标/版本不受影响；MSVC 请勿走这条路（见函数头注释），上面已按目标环境分流。
         println!("cargo:rustc-link-arg={}", res_path.display());
     } else {
         eprintln!(
