@@ -16,15 +16,16 @@
 # - package job 承担「唯一出包口」：本地无需保留 target/ 等重产物。
 #   发布策略参照 sevnX 的 CI：main 上每次构建都覆盖发布同一个 pre-release
 #   （固定 tag `latest`，资产用 --clobber 覆盖、tag 强制移动、标题说明刷新），
-#   打 `v*` tag 则发布正式 release；同时仍上传 artifact 备用。
+#   推 tag 则发布该 tag 的正式 release；只产出 NSIS 安装包，同时上传 artifact 备用。
 
 name: CI
 
 on:
   push:
     branches: [main, master]
-    # 打 v* tag 触发正式 release；main 分支推送触发滚动 pre-release
-    tags: ["v*"]
+    # tag 触发正式 release：同时接受 `v1.2.0` 与历史沿用的裸版本号 `1.2.0`
+    # （仓库既有 release 用的是 1.1.x 这种裸版本 tag）
+    tags: ["v*", "[0-9]*"]
   pull_request:
   # C-04：手动触发的发布包门禁（构建 NSIS 安装包并校验产物）
   workflow_dispatch:
@@ -120,15 +121,16 @@ jobs:
       - name: cargo clippy --locked --all-targets (0 warning 门禁)
         run: cargo clippy --locked --all-targets -- -D warnings
 
-  # C-04：发布包门禁。workflow_dispatch 或 v* tag 触发；构建 NSIS 并校验产物，
+  # C-04：发布包门禁。workflow_dispatch / tag / main 推送触发；构建 NSIS 并校验产物，
   # 随后上传为可下载 artifact（本地产物因此可随时删除，需要出包时再取）。
-  # 发布包：main 推送 / v* tag / 手动 dispatch 触发。构建 NSIS 并校验产物后，
-  # 按 sevnX 的方式发布 release（main → 覆盖滚动 pre-release；tag → 正式 release），
-  # 同时上传 artifact 备用。
+  # 发布包：main 推送 / tag / 手动 dispatch 触发。构建 NSIS 并校验产物后，
+  # 按 sevnX 的方式发布 release（main → 覆盖滚动 pre-release；tag → 正式 release）。
+  # 只产出 NSIS 安装包本身，不再产出免安装 exe。
   package:
     name: package (tauri build / NSIS / release)
     runs-on: windows-latest
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    # tag 一律触发（兼容历史裸版本号 `1.1.4` 与带前缀 `v1.1.4` 两种习惯）
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
     # 顶层只读；仅本 job 需要写权限来创建/更新 release 与移动滚动 tag
     permissions:
       contents: write
@@ -172,7 +174,10 @@ jobs:
           MIMO_FFMPEG_REQUIRE: "1"
         run: npm run tauri build -- --bundles nsis
 
-      - name: Verify packaged resources (ffmpeg exe + sha256 + WebView2Loader)
+      # 静默安装到隔离目录，逐项核对安装包是否真的带上了编译期声明的静态资产。
+      # 资产清单直接从 tauri.conf.json 的 bundle.resources 读取（不硬编码），
+      # 以后往配置里新增资源文件也会被这里自动校验，不会漏检。
+      - name: Verify installed package contains all declared static assets
         shell: pwsh
         run: |
           $nsis = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
@@ -183,42 +188,62 @@ jobs:
           New-Item -ItemType Directory -Force -Path $installDir | Out-Null
           $proc = Start-Process -FilePath $nsis.FullName -ArgumentList "/S", "/D=$installDir" -Wait -PassThru
           if ($proc.ExitCode -ne 0) { throw "Installer silent run failed: $($proc.ExitCode)" }
-          $exe = Join-Path $installDir "resources\ffmpeg.exe"
-          $sha = Join-Path $installDir "resources\ffmpeg.exe.sha256"
-          $wv2 = Join-Path $installDir "WebView2Loader.dll"
-          if (-not (Test-Path $exe)) { throw "ffmpeg.exe missing in installed package" }
-          if (-not (Test-Path $sha)) { throw "ffmpeg.exe.sha256 missing in installed package" }
-          if (-not (Test-Path $wv2)) { throw "WebView2Loader.dll missing in installed package" }
+
+          # 1) tauri.conf.json bundle.resources 声明的每个资源都必须在安装目录中就位
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $declared = @($conf.bundle.resources)
+          if ($declared.Count -eq 0) { throw "bundle.resources is empty - check tauri.conf.json" }
+          foreach ($res in $declared) {
+            $rel = ($res -replace '/', '\')
+            $target = Join-Path $installDir $rel
+            if (-not (Test-Path $target)) { throw "declared resource missing in installed package: $res" }
+            $size = (Get-Item $target).Length
+            if ($size -le 0) { throw "declared resource is empty: $res" }
+            Write-Host "resource OK: $res ($size bytes)"
+          }
+
+          # 2) 主程序本体在位且体积合理（前端 dist/ 由 tauri-codegen 编进该 exe，
+          #    故它的存在与体积同时证明前端资源已被打包）
+          $mainExes = @(Get-ChildItem -Path $installDir -Filter *.exe |
+            Where-Object { $_.Name -ne 'uninstall.exe' })
+          if ($mainExes.Count -eq 0) { throw "no application exe found in installed package" }
+          $main = $mainExes | Sort-Object Length -Descending | Select-Object -First 1
+          if ($main.Length -lt 1MB) { throw "application exe looks truncated: $($main.Name) $($main.Length) bytes" }
+          Write-Host "application exe OK: $($main.Name) ($([math]::Round($main.Length/1MB,2)) MB)"
+
+          # 3) 捆绑 ffmpeg 的哈希必须与仓库基准一致（防打包串包/损坏）
           $expected = (Select-String -Path src-tauri/resources/ffmpeg.exe.sha256 -Pattern '[0-9a-fA-F]{64}').Matches[0].Value.ToUpper()
-          $installed = (Get-FileHash $exe -Algorithm SHA256).Hash.ToUpper()
+          $installed = (Get-FileHash (Join-Path $installDir "resources\ffmpeg.exe") -Algorithm SHA256).Hash.ToUpper()
           if ($installed -ne $expected) { throw "installed ffmpeg.exe hash mismatch" }
           Write-Host "Package integrity OK, ffmpeg SHA-256 = $installed"
 
-      # tag 触发时校验 tag 与 package.json 版本一致，避免产物名与版本错配
+      # tag 触发时校验 tag 与 package.json 版本一致，避免产物名与版本错配。
+      # 用 $env:GITHUB_REF_NAME 而不是 ${{ github.ref_name }}：免模板替换，
+      # 脚本本体可被本地静态解析校验（该步骤只在 tag 推送时执行）。
       - name: Verify tag matches package version (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $tag = "${{ github.ref_name }}".TrimStart("v")
-          if ($pkg -ne $tag) { throw "tag v$tag does not match package.json version $pkg" }
-          Write-Host "tag/version OK: v$pkg"
+          $tag = $env:GITHUB_REF_NAME.TrimStart("v")
+          if ($pkg -ne $tag) { throw "tag '$env:GITHUB_REF_NAME' does not match package.json version $pkg" }
+          Write-Host "tag/version OK: $($env:GITHUB_REF_NAME) == $pkg"
 
-      # 出包口：安装包 + 免安装 exe 上传为 artifact（运行页面 Artifacts 区下载）
-      - name: Upload installer + portable exe
+      # 出包口：仅上传 NSIS 安装包（运行页面 Artifacts 区下载）
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: mimo-asr-assistant-${{ github.ref_name }}
           if-no-files-found: error
           retention-days: 30
-          path: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/mimo-asr-assistant.exe
+          path: src-tauri/target/release/bundle/nsis/*.exe
 
       # 发布（参照 sevnX CI）：
       # - main 推送 → 覆盖发布固定 tag `latest` 的 pre-release：资产 --clobber 覆盖、
       #   tag 强制移动到本次 commit、标题/说明刷新，保证页面与二进制一致；
-      # - v* tag → 发布该 tag 的正式 release（自动生成 release notes）。
+      # - tag 推送 → 发布该 tag 的正式 release（自动生成 release notes）。
+      # 只发布安装包；免安装 exe 已不再产出，脚本会顺带清掉 release 上遗留的
+      # 旧免安装资产（--clobber 只覆盖同名资产，不会自己消失）。
       # 资产名不能含空格：GitHub 会把空格重写成点，下载 URL 将不可预期，
       # 而 Tauri 按 productName 命名的安装包含空格，故在此重命名。
       - name: Publish release (rolling pre-release on main / release on tag)
@@ -229,13 +254,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           installers=(src-tauri/target/release/bundle/nsis/*.exe)
-          portable="src-tauri/target/release/mimo-asr-assistant.exe"
           if [ ${#installers[@]} -eq 0 ]; then
             echo "no NSIS installer was produced" >&2
-            exit 1
-          fi
-          if [ ! -f "$portable" ]; then
-            echo "portable exe not found: $portable" >&2
             exit 1
           fi
 
@@ -244,7 +264,8 @@ jobs:
             tag="$GITHUB_REF_NAME"
             title="MiMo ASR Assistant $tag"
             name="mimo-asr-assistant-${tag}-setup.exe"
-            portable_name="mimo-asr-assistant-${tag}.exe"
+            # 历史遗留的免安装 exe 命名（含带 tag 与不带 tag 两种）
+            obsolete=("mimo-asr-assistant-${tag}.exe" "mimo-asr-assistant.exe")
             options=(--generate-notes)
             rolling=false
           else
@@ -253,18 +274,23 @@ jobs:
             title="Latest build (main, $(date -u +%Y-%m-%d))"
             notes="Automatic build of main at ${GITHUB_SHA} (v${version})"
             name="mimo-asr-assistant-setup.exe"
-            portable_name="mimo-asr-assistant.exe"
+            obsolete=("mimo-asr-assistant.exe")
             options=(--prerelease --notes "$notes")
             rolling=true
           fi
 
-          staged_installer="${RUNNER_TEMP}/${name}"
-          staged_portable="${RUNNER_TEMP}/${portable_name}"
-          cp "${installers[0]}" "$staged_installer"
-          cp "$portable" "$staged_portable"
+          staged="${RUNNER_TEMP}/${name}"
+          cp "${installers[0]}" "$staged"
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$staged_installer" "$staged_portable" --clobber
+            gh release upload "$tag" "$staged" --clobber
+            # 清掉不再产出的旧资产，使 release 上只留安装包
+            for old in "${obsolete[@]}"; do
+              if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$old"; then
+                gh release delete-asset "$tag" "$old" --yes
+                echo "removed obsolete asset: $old"
+              fi
+            done
             if [ "$rolling" = true ]; then
               # 只换资产的话，release 页面仍显示首次创建它的 commit 与服务旧标题/说明；
               # 故同时移动 tag 并刷新标题/说明，使页面与本次二进制一致。
@@ -272,8 +298,7 @@ jobs:
               gh release edit "$tag" --title "$title" --notes "$notes"
             fi
           else
-            gh release create "$tag" --title "$title" "${options[@]}" \
-              "$staged_installer" "$staged_portable"
+            gh release create "$tag" --title "$title" "${options[@]}" "$staged"
           fi
           gh release view "$tag" --json tagName,isPrerelease,assets \
             --jq '"published " + .tagName + " prerelease=" + (.isPrerelease|tostring) + " assets=" + ([.assets[].name]|join(","))'

@@ -118,15 +118,15 @@ npm run tauri dev
 | `frontend` | npm ci → typecheck → lint → vitest → build → version:check |
 | `rust` | ffmpeg.exe SHA-256 基准比对 → cargo check/test/clippy --all-targets（均 `--locked`；build.rs 门禁编译期再校验一次哈希） |
 | `security` | `npm audit --omit=dev --audit-level=high` + 固定版本 `cargo audit --deny warnings`（已登记例外见 `src-tauri/.cargo/audit.toml` 与 SECURITY.md） |
-| `package` | main 推送 / `v*` tag / 手动 dispatch 时运行：`tauri build --bundles nsis` → 静默安装校验 ffmpeg/WebView2Loader 与哈希 → 上传 artifact，并发布 release（见下） |
+| `package` | main 推送 / tag / 手动 dispatch 时运行：`tauri build --bundles nsis` → 静默安装后逐项核对 `bundle.resources` 声明的静态资产与 ffmpeg 哈希 → 上传安装包 artifact，并发布 release（见下）。只产出 NSIS 安装包 |
 
 **取安装包**（本地不再需要 `src-tauri/target/`）：
 
 方式一，Releases 页面直接下载（推荐，资产是原始 .exe 而不是 zip）：
 - **滚动 pre-release**：每次 main 构建都会覆盖发布固定 tag [`latest`](https://github.com/Bronzesakon/MiMo-ASR-Assistant/releases/tag/latest) 的 pre-release——资产用 `--clobber` 覆盖、tag 强制移动到本次 commit、标题与说明刷新，所以页面上永远是 main 最新一次构建的产物。
-- **正式 release**：推 `v*` tag（`git tag v1.2.0 && git push origin v1.2.0`）会发布该 tag 的正式 release 并自动生成 release notes；tag 触发时会校验 tag 与 `package.json` 版本一致，不一致直接失败。
+- **正式 release**：推 tag 会发布该 tag 的正式 release 并自动生成 release notes。`v1.2.0` 与仓库历史沿用的裸版本号 `1.2.0` 两种写法都接受；tag 触发时会校验 tag 与 `package.json` 版本一致，不一致直接失败。
 
-方式二，该次运行的页面底部 **Artifacts** 下载 `mimo-asr-assistant-<ref>`（保留 30 天，含安装包与免安装 exe），适合需要保留某次具体构建的场景。
+方式二，该次运行的页面底部 **Artifacts** 下载 `mimo-asr-assistant-<ref>`（保留 30 天，只含 NSIS 安装包），适合需要保留某次具体构建的场景。
 
 说明：
 - 资产名去掉了空格与版本号（`mimo-asr-assistant-setup.exe`）：GitHub 会把资产名里的空格重写成点，导致下载 URL 不可预期。
@@ -202,7 +202,7 @@ npm run tauri version <x.y.z>
 2. **锁文件**：`package-lock.json` 与 `src-tauri/Cargo.lock` 已提交且未漂移。
 3. **CI 全绿**：`frontend` / `rust` / `security` 三 job 全部通过；tag/手动触发的 `package` job 亦通过；本地等价命令见「质量门禁」。
 4. **依赖审计**：`npm audit --omit=dev` 无 high/critical；`cargo audit --deny warnings` 通过（例外已在 SECURITY.md 登记到期日，且仅限 `src-tauri/.cargo/audit.toml` 中的 ID）。
-5. **release 构建（在 CI）**：推 `v*` tag 后 `package` job 成功，正式 release 上出现安装包与免安装 exe；仅需 main 最新构建时，直接取 `latest` 滚动 pre-release 的资产即可。本地 `npm run tauri build` 为等价可选路径，非必需。
+5. **release 构建（在 CI）**：推 tag 后 `package` job 成功，正式 release 上出现安装包；仅需 main 最新构建时，直接取 `latest` 滚动 pre-release 的资产即可。本地 `npm run tauri build` 为等价可选路径，非必需。
 6. **安装包 ffmpeg 校验**：安装后确认安装目录下 `resources/ffmpeg.exe` 存在，且与 `src-tauri/resources/ffmpeg.exe.sha256` 哈希一致：
    ```powershell
    Get-FileHash <安装目录>\resources\ffmpeg.exe -Algorithm SHA256
