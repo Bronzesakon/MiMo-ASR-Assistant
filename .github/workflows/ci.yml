@@ -1,7 +1,8 @@
 # 清单 I-01：CI 质量门禁（frontend / rust / security 三 job 并行 + 发布打包）
 #
 # 设计约束（按清单 I-01/I-02 原文）：
-# - 权限最小化：顶层 permissions 只读，无任何写权限。
+# - 权限最小化：顶层 permissions 只读；仅 package job 为发布 release 提升为
+#   任务级 `contents: write`，其余三个 job 保持只读。
 # - 依赖可重复：npm 一律 `npm ci` + 已提交 package-lock.json；
 #   Cargo 一律 `--locked` + 已提交 Cargo.lock，禁止 CI 静默解析到不同依赖。
 # - 缓存范围仅限 npm 下载缓存与 Cargo registry/git/target；
@@ -12,17 +13,17 @@
 # - ffmpeg.exe 已入库（resources/ffmpeg.exe + .sha256），build.rs 的
 #   SHA-256 门禁在 cargo check/test/clippy 编译期强制执行；rust job
 #   另设显式哈希比对步骤，使门禁失败时日志更直观。
-# - package job 承担「唯一出包口」：本地无需保留 target/ 等重产物，
-#   打 `v*` tag 或手动 dispatch 即在 CI 产出 NSIS 安装包并上传为
-#   artifact（在运行页面的 Artifacts 区下载）；上传不需要写权限，
-#   故顶层 permissions 仍保持只读。
+# - package job 承担「唯一出包口」：本地无需保留 target/ 等重产物。
+#   发布策略参照 sevnX 的 CI：main 上每次构建都覆盖发布同一个 pre-release
+#   （固定 tag `latest`，资产用 --clobber 覆盖、tag 强制移动、标题说明刷新），
+#   打 `v*` tag 则发布正式 release；同时仍上传 artifact 备用。
 
 name: CI
 
 on:
   push:
     branches: [main, master]
-    # 打 v* tag 即触发 package job 出包（artifact 可在运行页面下载）
+    # 打 v* tag 触发正式 release；main 分支推送触发滚动 pre-release
     tags: ["v*"]
   pull_request:
   # C-04：手动触发的发布包门禁（构建 NSIS 安装包并校验产物）
@@ -30,6 +31,11 @@ on:
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 增量产物会撑大缓存且在全新 runner 上无用（参照 sevnX CI）
+  CARGO_INCREMENTAL: "0"
 
 # 同一分支/PR 有新提交时取消旧运行，节省 runner
 concurrency:
@@ -116,10 +122,16 @@ jobs:
 
   # C-04：发布包门禁。workflow_dispatch 或 v* tag 触发；构建 NSIS 并校验产物，
   # 随后上传为可下载 artifact（本地产物因此可随时删除，需要出包时再取）。
+  # 发布包：main 推送 / v* tag / 手动 dispatch 触发。构建 NSIS 并校验产物后，
+  # 按 sevnX 的方式发布 release（main → 覆盖滚动 pre-release；tag → 正式 release），
+  # 同时上传 artifact 备用。
   package:
-    name: package (tauri build / NSIS)
+    name: package (tauri build / NSIS / release)
     runs-on: windows-latest
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    # 顶层只读；仅本 job 需要写权限来创建/更新 release 与移动滚动 tag
+    permissions:
+      contents: write
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -136,6 +148,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+
+      # NSIS 等打包工具链由 Tauri CLI 首次下载后复用（参照 sevnX CI）
+      - name: Cache Tauri bundler toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/tauri
+          key: ${{ runner.os }}-tauri-bundler-${{ hashFiles('src-tauri/tauri.conf.json') }}
+          restore-keys: ${{ runner.os }}-tauri-bundler-
 
       - name: Install dependencies (npm ci, 锁文件一致)
         run: npm ci
@@ -194,6 +214,69 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/mimo-asr-assistant.exe
+
+      # 发布（参照 sevnX CI）：
+      # - main 推送 → 覆盖发布固定 tag `latest` 的 pre-release：资产 --clobber 覆盖、
+      #   tag 强制移动到本次 commit、标题/说明刷新，保证页面与二进制一致；
+      # - v* tag → 发布该 tag 的正式 release（自动生成 release notes）。
+      # 资产名不能含空格：GitHub 会把空格重写成点，下载 URL 将不可预期，
+      # 而 Tauri 按 productName 命名的安装包含空格，故在此重命名。
+      - name: Publish release (rolling pre-release on main / release on tag)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*.exe)
+          portable="src-tauri/target/release/mimo-asr-assistant.exe"
+          if [ ${#installers[@]} -eq 0 ]; then
+            echo "no NSIS installer was produced" >&2
+            exit 1
+          fi
+          if [ ! -f "$portable" ]; then
+            echo "portable exe not found: $portable" >&2
+            exit 1
+          fi
+
+          version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            title="MiMo ASR Assistant $tag"
+            name="mimo-asr-assistant-${tag}-setup.exe"
+            portable_name="mimo-asr-assistant-${tag}.exe"
+            options=(--generate-notes)
+            rolling=false
+          else
+            # 滚动 tag 刻意不带 v 前缀：否则会匹配本 workflow 的 `v*` 触发而再跑一次
+            tag="latest"
+            title="Latest build (main, $(date -u +%Y-%m-%d))"
+            notes="Automatic build of main at ${GITHUB_SHA} (v${version})"
+            name="mimo-asr-assistant-setup.exe"
+            portable_name="mimo-asr-assistant.exe"
+            options=(--prerelease --notes "$notes")
+            rolling=true
+          fi
+
+          staged_installer="${RUNNER_TEMP}/${name}"
+          staged_portable="${RUNNER_TEMP}/${portable_name}"
+          cp "${installers[0]}" "$staged_installer"
+          cp "$portable" "$staged_portable"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$staged_installer" "$staged_portable" --clobber
+            if [ "$rolling" = true ]; then
+              # 只换资产的话，release 页面仍显示首次创建它的 commit 与服务旧标题/说明；
+              # 故同时移动 tag 并刷新标题/说明，使页面与本次二进制一致。
+              git push --force origin "HEAD:refs/tags/$tag"
+              gh release edit "$tag" --title "$title" --notes "$notes"
+            fi
+          else
+            gh release create "$tag" --title "$title" "${options[@]}" \
+              "$staged_installer" "$staged_portable"
+          fi
+          gh release view "$tag" --json tagName,isPrerelease,assets \
+            --jq '"published " + .tagName + " prerelease=" + (.isPrerelease|tostring) + " assets=" + ([.assets[].name]|join(","))'
 
   security:
     name: security (npm audit / cargo audit)
