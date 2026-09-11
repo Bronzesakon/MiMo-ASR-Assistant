@@ -123,7 +123,7 @@ npm run tauri dev
 **取安装包**（本地不再需要 `src-tauri/target/`）：
 
 方式一，Releases 页面直接下载（推荐，资产是原始 .exe 而不是 zip）：
-- **滚动 pre-release**：每次 main 构建都会覆盖发布固定 tag [`latest`](https://github.com/Bronzesakon/MiMo-ASR-Assistant/releases/tag/latest) 的 pre-release——资产用 `--clobber` 覆盖、tag 强制移动到本次 commit、标题与说明刷新，所以页面上永远是 main 最新一次构建的产物。
+- **滚动 pre-release**：每次 main 构建都会覆盖发布固定 tag [`latest`](https://github.com/Bronzesakon/MiMo-ASR-Assistant/releases/tag/latest) 的 pre-release——资产用 `--clobber` 覆盖、tag 强制移动到本次 commit、标题与说明刷新，所以页面上永远是 main 最新一次构建的产物。标题与说明里带**精确到秒的 UTC+8 构建开始时间**（另附本次 commit 的提交时间），便于确认拿到的是哪一次构建。
 - **正式 release**：推 tag 会发布该 tag 的正式 release 并自动生成 release notes。`v1.2.0` 与仓库历史沿用的裸版本号 `1.2.0` 两种写法都接受；tag 触发时会校验 tag 与 `package.json` 版本一致，不一致直接失败。
 
 方式二，该次运行的页面底部 **Artifacts** 下载 `mimo-asr-assistant-<ref>`（保留 30 天，只含 NSIS 安装包），适合需要保留某次具体构建的场景。

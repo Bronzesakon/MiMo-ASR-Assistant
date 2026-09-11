@@ -139,6 +139,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 记录构建开始时间与本次提交时间（均换算 UTC+8，精确到秒），供 release 标题/说明使用。
+      # 用算术换算（epoch + 28800）而非 TZ=Asia/Shanghai：runner 的 tz 数据库是否可用、
+      # date 是否认 TZ 都不该成为依赖——实测 Git Bash 下 TZ=Asia/Shanghai 会静默退回 GMT，
+      # 从而写出错误的"UTC+8"时间。中国无夏令时，固定 +8 小时全年正确。
+      # 做法与 E:\Zcode_harmony 的 CI 一致；同时回显到日志，便于事后核对。
+      - name: Record timestamps (UTC+8)
+        shell: bash
+        run: |
+          cst() { # $1 = ISO 时间戳（空则取当前时间）；$2 = date 输出格式
+            local epoch
+            if [ -n "$1" ]; then epoch=$(date -u -d "$1" +%s); else epoch=$(date -u +%s); fi
+            date -u -d "@$((epoch + 28800))" "$2"
+          }
+          build_start=$(cst '' '+%Y-%m-%d %H:%M:%S')
+          push_time=$(cst "$(git log -1 --pretty=%cI)" '+%Y-%m-%d %H:%M:%S')
+          {
+            echo "BUILD_START_UTC8=$build_start"
+            echo "PUSH_TIME_UTC8=$push_time"
+          } >> "$GITHUB_ENV"
+          echo "构建开始 $build_start（UTC+8） · 提交 $push_time（UTC+8）"
+
       - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
@@ -259,20 +280,33 @@ jobs:
             exit 1
           fi
 
+          # 时间戳由前面的 Record timestamps 步骤写入 GITHUB_ENV（UTC+8，精确到秒）；
+          # 兜底重算一次，避免该步骤被跳过时写出空时间。
+          cst_fallback() {
+            local epoch
+            if [ -n "$1" ]; then epoch=$(date -u -d "$1" +%s); else epoch=$(date -u +%s); fi
+            date -u -d "@$((epoch + 28800))" '%Y-%m-%d %H:%M:%S'
+          }
+          build_start="${BUILD_START_UTC8:-$(cst_fallback '')}"
+          push_time="${PUSH_TIME_UTC8:-$(cst_fallback "$(git log -1 --pretty=%cI)")}"
+
           version="$(node -p "require('./package.json').version")"
+          # 说明里固定带上两个 UTC+8 时间戳：提交时间取自 commit（重跑/重发也仍有意义），
+          # 构建开始时间取自本次 package job。
+          notes="构建开始 ${build_start}（UTC+8） · 提交 ${push_time}（UTC+8） · commit \`${GITHUB_SHA:0:7}\` · v${version}"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             tag="$GITHUB_REF_NAME"
             title="MiMo ASR Assistant $tag"
             name="mimo-asr-assistant-${tag}-setup.exe"
             # 历史遗留的免安装 exe 命名（含带 tag 与不带 tag 两种）
             obsolete=("mimo-asr-assistant-${tag}.exe" "mimo-asr-assistant.exe")
-            options=(--generate-notes)
+            # 自带说明在前，GitHub 生成的 changelog 追加在后
+            options=(--notes "$notes" --generate-notes)
             rolling=false
           else
             # 滚动 tag 刻意不带 v 前缀：否则会匹配本 workflow 的 `v*` 触发而再跑一次
             tag="latest"
-            title="Latest build (main, $(date -u +%Y-%m-%d))"
-            notes="Automatic build of main at ${GITHUB_SHA} (v${version})"
+            title="Latest build (main, ${build_start} UTC+8)"
             name="mimo-asr-assistant-setup.exe"
             obsolete=("mimo-asr-assistant.exe")
             options=(--prerelease --notes "$notes")
