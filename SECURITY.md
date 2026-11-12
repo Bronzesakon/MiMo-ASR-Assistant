@@ -50,10 +50,11 @@ Get-FileHash src-tauri\resources\ffmpeg.exe -Algorithm SHA256
 
 ## 依赖审计现状（清单 I-02）
 
-- `npm audit --omit=dev`：**0 漏洞**。历史修复均由锁文件升级传递依赖完成：PostCSS high 于 2026-08 升至 8.5.25（来自 vite / @vue/compiler-sfc）；nanoid high（GHSA-2v37-7h3g-55p8，size 为 0 时自定义生成器可能死循环）于 2026-09-10 升至 3.3.18（来自 vite → postcss）。
+- `npm audit --omit=dev`：**0 漏洞**。历史修复均由锁文件升级传递依赖完成：PostCSS high 于 2026-08 升至 8.5.25（来自 vite / @vue/compiler-sfc）；nanoid high（GHSA-2v37-7h3g-55p8，size 为 0 时自定义生成器可能死循环）于 2026-09-10 升至 3.3.18（来自 vite → postcss）；2026-11-12 升至 `vue` / `@vue/*` 3.5.45（GHSA-g2v6-rqmx-r4w6 服务端渲染 XSS）、`dompurify` 3.4.17（5 项 DOM XSS 公告，含 critical GHSA-p98j-92pf-mc4p）、`source-map-js` 1.2.2（GHSA-68fv-2mgg-jv7q）。
 - `cargo audit --deny warnings`：已接入 CI security job，cargo-audit 固定为 **0.22.2**（原 0.21.2 已弃用：该版本无法解析 advisory-db 中新增的 CVSS 4.0 条目，`error loading advisory database: unsupported CVSS version: 4.0`，与漏洞无关却恒使 job 失败）。
-- 2026-09-10 锁文件升级已消除全部可修复项：`anyhow` 1.0.102 → 1.0.104、`event-listener` 5.4.1 → 5.4.2、`h2` 0.4.15 → 0.4.19、`plist` 1.9.0 → 1.10.1（带动 `quick-xml` 0.39.4 → 0.42.0）。**当前 0 漏洞。**
-- 其余 7 条 warning 均无可用修复，按 ID 精确豁免（清单见 `src-tauri/.cargo/audit.toml`），逐条登记如下。
+- 2026-09-10 锁文件升级已消除全部可修复项：`anyhow` 1.0.102 → 1.0.104、`event-listener` 5.4.1 → 5.4.2、`h2` 0.4.15 → 0.4.19、`plist` 1.9.0 → 1.10.1（带动 `quick-xml` 0.39.4 → 0.42.0）。
+- 2026-11-12 锁文件升级：`rustls` 0.23.40 → 0.23.46（RUSTSEC-2026-0285 / 0346 / 0348 / 0349）、`rustls-webpki` 0.103.13 → 0.103.16（RUSTSEC-2026-0382）、`tokio` 1.52.3 → 1.54.1（RUSTSEC-2026-0386）、`rustix` 1.1.4 → 1.1.6（RUSTSEC-2026-0486）、`async-executor` 1.14.0 → 1.14.1（yanked）、`zbus` 5.16.0 → 5.19.0（属性链同步）。**当前 0 漏洞。**
+- 其余 10 条 warning 均无可用修复，按 ID 精确豁免（清单见 `src-tauri/.cargo/audit.toml`），逐条登记如下。
 
 ### 已登记例外（到期需复查）
 
@@ -66,6 +67,9 @@ Get-FileHash src-tauri\resources\ffmpeg.exe -Algorithm SHA256
 | RUSTSEC-2025-0081 | unic-char-property 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0081 | 2026-12-10 | @Bronzesakon |
 | RUSTSEC-2025-0098 | unic-ucd-version 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0098 | 2026-12-10 | @Bronzesakon |
 | RUSTSEC-2025-0100 | unic-ucd-ident 0.9.0 | unmaintained | 同上（urlpattern 0.3 依赖链） | https://rustsec.org/advisories/RUSTSEC-2025-0100 | 2026-12-10 | @Bronzesakon |
+| RUSTSEC-2026-0370 | zvariant 5.15.1 | unmaintained | 经 tauri-plugin-opener / tauri-plugin-single-instance → zbus 5 引入，Linux 目标才编译；上游无替代版本 | https://rustsec.org/advisories/RUSTSEC-2026-0370 | 2027-02-12 | @Bronzesakon |
+| RUSTSEC-2026-0371 | zbus_names 4.3.5 | unmaintained | 同上（zbus 5 依赖链，Linux 目标才编译） | https://rustsec.org/advisories/RUSTSEC-2026-0371 | 2027-02-12 | @Bronzesakon |
+| RUSTSEC-2026-0372 | zvariant_derive 5.15.1 | unmaintained | 同上（zbus 5 依赖链，Linux 目标才编译） | https://rustsec.org/advisories/RUSTSEC-2026-0372 | 2027-02-12 | @Bronzesakon |
 
 **复查要求**：到期前重跑 `cargo audit --deny warnings`，若上游已发布修复（tauri 升级 gtk-rs / urlpattern 换依赖），则升级依赖并删除对应 ignore；否则重新评估风险并顺延到期日期。豁免仅限上表 ID，任何新增 advisory 仍会阻断 CI。
 
