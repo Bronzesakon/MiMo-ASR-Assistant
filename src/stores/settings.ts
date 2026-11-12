@@ -25,12 +25,12 @@ const BUILTIN_POLISH_PROVIDERS = ['deepseek', 'mimo-api', 'mimo-token-plan']
 /** 内置规整服务商的合法模型集合（H-03 归一基准，与后端 provider 定义一致） */
 const BUILTIN_POLISH_MODELS: Record<string, string[]> = {
   'deepseek': ['deepseek-v4-pro', 'deepseek-v4-flash'],
-  'mimo-api': ['mimo-v2.5', 'mimo-v2.5-pro'],
-  'mimo-token-plan': ['mimo-v2.5', 'mimo-v2.5-pro'],
+  'mimo-api': ['mimo-v2.6-flash'],
+  'mimo-token-plan': ['mimo-v2.6-flash'],
 }
 
 const DEFAULT_POLISH_PROVIDER = 'deepseek'
-const DEFAULT_POLISH_MODEL = 'mimo-v2.5'
+const DEFAULT_POLISH_MODEL = 'mimo-v2.6-flash'
 
 /** 需要落盘的配置字段（用于 dirtyFields 追踪与提交后回填 draft） */
 type FieldKey =
@@ -48,7 +48,7 @@ function defaultConfig(): ApiConfig {
     baseUrl: 'https://api.xiaomimimo.com/v1',
     apiKey: '',
     transcriptionModel: 'mimo-v2.5-asr',
-    polishModel: 'mimo-v2.5',
+    polishModel: 'mimo-v2.6-flash',
     providerKeys: {},
     loggingEnabled: true,
     asrProvider: 'mimo-api',

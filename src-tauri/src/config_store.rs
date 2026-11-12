@@ -494,6 +494,12 @@ fn load_repository(path: &Path) -> ConfigRepoState {
     let (config, unreadable) = decrypt_config_fields_tracked(doc.config);
     doc.config = config;
 
+    // 已下线模型迁移：历史配置里的 polish_model（如 mimo-v2.5）按 provider 合法集合归一，
+    // 避免界面下拉无匹配项、请求打到已下线的模型 ID。只读配置保持原样。
+    if read_only_reason.is_none() {
+        normalize_polish_config(&mut doc.config);
+    }
+
     ConfigRepoState {
         doc,
         notice,
@@ -893,6 +899,20 @@ mod tests {
             ..sample_input()
         };
         assert!(repo.upsert_custom_provider(2, bad).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 已下线模型（mimo-v2.5）在加载时归一为当前唯一可用模型
+    #[tokio::test]
+    async fn stale_polish_model_normalized_on_load() {
+        let dir = test_dir("stale_model");
+        let mut json: serde_json::Value = serde_json::from_str(&valid_json()).unwrap();
+        json["polish_provider"] = serde_json::Value::String("mimo-api".into());
+        json["polish_model"] = serde_json::Value::String("mimo-v2.5".into());
+        let repo = repo_with(&dir, &json.to_string());
+        let snap = repo.snapshot().await;
+        assert_eq!(snap.config.polish_provider, "mimo-api");
+        assert_eq!(snap.config.polish_model, "mimo-v2.6-flash");
         std::fs::remove_dir_all(&dir).ok();
     }
 

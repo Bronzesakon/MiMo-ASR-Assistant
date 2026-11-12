@@ -47,7 +47,7 @@ pub fn get_providers() -> Vec<ProviderInfo> {
             base_url: "https://api.xiaomimimo.com/v1".to_string(),
             key_prefix: "sk-".to_string(),
             asr_models: vec!["mimo-v2.5-asr".to_string()],
-            chat_models: vec!["mimo-v2.5".to_string(), "mimo-v2.5-pro".to_string()],
+            chat_models: vec!["mimo-v2.6-flash".to_string()],
         },
         ProviderInfo {
             id: "mimo-token-plan".to_string(),
@@ -55,7 +55,7 @@ pub fn get_providers() -> Vec<ProviderInfo> {
             base_url: "https://token-plan-cn.xiaomimimo.com/v1".to_string(),
             key_prefix: "tp-".to_string(),
             asr_models: vec!["mimo-v2.5-asr".to_string()],
-            chat_models: vec!["mimo-v2.5".to_string(), "mimo-v2.5-pro".to_string()],
+            chat_models: vec!["mimo-v2.6-flash".to_string()],
         },
         ProviderInfo {
             id: "deepseek".to_string(),

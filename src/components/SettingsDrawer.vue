@@ -36,8 +36,8 @@ const asrProviders = [
 
 const polishProviders = [
   { id: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com', prefix: 'sk-', keyLabel: 'DeepSeek API Key', chat: ['deepseek-v4-pro', 'deepseek-v4-flash'] },
-  { id: 'mimo-api', name: 'MiMo API', url: 'https://api.xiaomimimo.com/v1', prefix: 'sk-', keyLabel: 'MiMo API Key', chat: ['mimo-v2.5', 'mimo-v2.5-pro'] },
-  { id: 'mimo-token-plan', name: 'MiMo Token Plan', url: 'https://token-plan-cn.xiaomimimo.com/v1', prefix: 'tp-', keyLabel: 'MiMo Token Plan Key', chat: ['mimo-v2.5', 'mimo-v2.5-pro'] },
+  { id: 'mimo-api', name: 'MiMo API', url: 'https://api.xiaomimimo.com/v1', prefix: 'sk-', keyLabel: 'MiMo API Key', chat: ['mimo-v2.6-flash'] },
+  { id: 'mimo-token-plan', name: 'MiMo Token Plan', url: 'https://token-plan-cn.xiaomimimo.com/v1', prefix: 'tp-', keyLabel: 'MiMo Token Plan Key', chat: ['mimo-v2.6-flash'] },
 ]
 
 const currentAsrProv = computed(() => asrProviders.find(p => p.id === store.apiConfig.asrProvider) || asrProviders[0])

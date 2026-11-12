@@ -119,7 +119,7 @@ impl Default for AppConfig {
             base_url: "https://api.xiaomimimo.com/v1".to_string(),
             api_key: String::new(),
             transcription_model: "mimo-v2.5-asr".to_string(),
-            polish_model: "mimo-v2.5".to_string(),
+            polish_model: "mimo-v2.6-flash".to_string(),
             theme: "system".to_string(),
             polish_prompt: default_polish_prompt(),
             provider_keys: HashMap::new(),

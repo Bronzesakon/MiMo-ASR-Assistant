@@ -34,8 +34,8 @@
 
 | 服务商 | 转写（ASR） | 规整（Chat） | Base URL |
 |--------|------------|-------------|----------|
-| MiMo API | `mimo-v2.5-asr` | `mimo-v2.5`、`mimo-v2.5-pro` | `https://api.xiaomimimo.com/v1` |
-| MiMo Token Plan | `mimo-v2.5-asr` | `mimo-v2.5`、`mimo-v2.5-pro` | `https://token-plan-cn.xiaomimimo.com/v1` |
+| MiMo API | `mimo-v2.5-asr` | `mimo-v2.6-flash` | `https://api.xiaomimimo.com/v1` |
+| MiMo Token Plan | `mimo-v2.5-asr` | `mimo-v2.6-flash` | `https://token-plan-cn.xiaomimimo.com/v1` |
 | DeepSeek | — | `deepseek-v4-pro`、`deepseek-v4-flash` | `https://api.deepseek.com` |
 
 ## 技术栈
